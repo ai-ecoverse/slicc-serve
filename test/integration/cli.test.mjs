@@ -117,3 +117,14 @@ test('--entry refuses a symlink out of the directory', {
   assert.equal(res.code, 1);
   assert.match(res.stderr, /^scserve: entry file not found: .*out\.html/);
 });
+
+test('the harness survives a scserve that exits before reading its stdin', async () => {
+  const box = sandbox();
+  for (let i = 0; i < 3; i++) {
+    const res = await box.run(['--version'], {}, { input: Buffer.alloc(4 * 1024 * 1024, 120) });
+    assert.equal(res.code, 0);
+    assert.equal(res.stdout, `${expectedVersion}\n`);
+  }
+  const quick = await Promise.all(Array.from({ length: 20 }, () => box.run(['--list'])));
+  assert.ok(quick.every((r) => r.code === 0 && r.stdout === 'no previews\n'));
+});

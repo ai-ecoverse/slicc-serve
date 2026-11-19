@@ -93,7 +93,10 @@ export function sandbox(hub) {
 
 export function run(args, env, { input, timeout = 60_000 } = {}) {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(binary, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(binary, args, {
+      env,
+      stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+    });
     const out = [];
     const err = [];
     child.stdout.on('data', (c) => out.push(c));
@@ -111,12 +114,17 @@ export function run(args, env, { input, timeout = 60_000 } = {}) {
         stderr: Buffer.concat(err).toString(),
       });
     });
-    child.stdin.end(input ?? '');
+    if (child.stdin) {
+      child.stdin.on('error', (e) => {
+        if (e.code !== 'EPIPE') reject(e);
+      });
+      child.stdin.end(input);
+    }
   });
 }
 
 export function start(args, env) {
-  const child = spawn(binary, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(binary, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '';
   let stderr = '';
   const waiters = [];
