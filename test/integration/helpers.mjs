@@ -116,7 +116,7 @@ export function run(args, env, { input, timeout = 60_000 } = {}) {
     });
     if (child.stdin) {
       child.stdin.on('error', (e) => {
-        if (e.code !== 'EPIPE') reject(e);
+        if (!['EPIPE', 'EOF', 'ECONNRESET'].includes(e.code)) reject(e);
       });
       child.stdin.end(input);
     }
