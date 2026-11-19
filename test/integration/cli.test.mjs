@@ -85,6 +85,10 @@ test('a missing directory or entry file exits 1', async () => {
   res = await box.run(['--entry', 'nope.html', site]);
   assert.equal(res.code, 1);
   assert.match(res.stderr, /^scserve: entry file not found: .*nope\.html/);
+  box.site({ '.env': 'SECRET=1' }, 'site');
+  res = await box.run(['--entry', '.env', site]);
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /^scserve: entry file not found: .*\.env/);
 });
 
 test('--upgrade from the npm launcher names the npm command', async () => {
@@ -98,4 +102,18 @@ test('an invalid tray hub URL exits 1', async () => {
   const res = await box.run([box.site()], { SLICC_TRAY_HUB: 'ftp://nope' });
   assert.equal(res.code, 1);
   assert.match(res.stderr, /^scserve: invalid tray hub URL ftp:\/\/nope/);
+});
+
+test('--entry refuses a symlink out of the directory', {
+  skip: process.platform === 'win32' && 'symlinks need privileges on Windows',
+}, async () => {
+  const box = sandbox();
+  const outside = box.site({ 'secret.html': 's' }, 'outside');
+  const site = box.site();
+  const { symlinkSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  symlinkSync(join(outside, 'secret.html'), join(site, 'out.html'));
+  const res = await box.run(['--local', '--entry', 'out.html', site]);
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /^scserve: entry file not found: .*out\.html/);
 });

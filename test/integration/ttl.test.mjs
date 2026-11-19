@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { truncateSync, writeFileSync } from 'node:fs';
+import { mkdirSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { fakeHub } from './fake-hub.mjs';
@@ -209,4 +209,27 @@ test('snapshots on a tray that was replaced stay listed and stoppable', async ()
   assert.equal((await box.run(['--stop', first.url])).code, 0);
   await box.run(['--list']);
   assert.deepEqual(box.tray().retired, []);
+});
+
+test('--ttl leaves out symlinks to hidden files and survives directories that link to each other', {
+  skip: process.platform === 'win32' && 'symlinks need privileges on Windows',
+}, async () => {
+  const box = sandbox(hub);
+  const site = box.site({
+    'index.html': 'x',
+    '.env': 'SECRET=1',
+    'a/one.txt': '1',
+    'b/two.txt': '2',
+  });
+  symlinkSync(join(site, '.env'), join(site, 'public.txt'));
+  symlinkSync('../b', join(site, 'a', 'tob'));
+  symlinkSync('../a', join(site, 'b', 'toa'));
+  mkdirSync(join(site, 'c'));
+  const res = await box.run(['--ttl', '1h', '--json', site]);
+  assert.equal(res.code, 0, res.stderr);
+  const out = JSON.parse(res.stdout);
+  const p = find(out.previewToken);
+  const names = [...p.files.keys()].sort();
+  assert.deepEqual(names, ['a/one.txt', 'a/tob/two.txt', 'index.html']);
+  assert.ok(![...p.files.values()].some((f) => f.bytes.toString().includes('SECRET')));
 });

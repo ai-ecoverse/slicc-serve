@@ -155,7 +155,8 @@ fn directory(dir: &str, entry: Option<&str>) -> Result<PathBuf, Failure> {
         return Err(plain(format!("not a directory: {dir}")));
     }
     if let Some(entry) = entry {
-        if !abs.join(entry).is_file() {
+        let found = serve_core::safe::found(&abs, &abs.join(entry));
+        if !found.is_some_and(|(_, meta)| meta.is_file()) {
             return Err(plain(format!(
                 "entry file not found: {}",
                 Path::new(dir).join(entry).display()

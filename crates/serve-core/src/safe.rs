@@ -80,7 +80,11 @@ pub fn hidden(name: &str) -> bool {
 
 pub fn inside(root: &Path, candidate: &Path) -> Option<PathBuf> {
     let real = std::fs::canonicalize(candidate).ok()?;
-    real.starts_with(root).then_some(real)
+    let rest = real.strip_prefix(root).ok()?;
+    let shown = rest
+        .components()
+        .all(|c| !hidden(&c.as_os_str().to_string_lossy()));
+    shown.then_some(real)
 }
 
 pub fn found(root: &Path, candidate: &Path) -> Option<(PathBuf, std::fs::Metadata)> {

@@ -25,6 +25,8 @@ async function foreground(box, site, extra = []) {
   return { proc, url, port: Number(new URL(url).port) };
 }
 
+const odd = process.platform === 'win32' ? 'files/b & c.txt' : 'files/b & <c>.txt';
+
 test('--local --foreground serves the directory with the built-in server', async () => {
   const box = sandbox();
   const site = box.site({
@@ -34,7 +36,7 @@ test('--local --foreground serves the directory with the built-in server', async
     'pic.png': Buffer.from([0x89, 0x50, 0x4e, 0x47]),
     'docs/index.html': '<h1>docs</h1>\n',
     'files/a.txt': 'alpha\n',
-    'files/b & <c>.txt': 'beta\n',
+    [odd]: 'beta\n',
     'files/.hidden': 'no\n',
     '.env': 'SECRET=1\n',
     '.git/config': '[core]\n',
@@ -75,9 +77,14 @@ test('--local --foreground serves the directory with the built-in server', async
   assert.equal(listing.status, 200);
   const html = listing.body.toString();
   assert.match(html, /<a href="a\.txt">a\.txt<\/a>/);
-  assert.match(html, /<a href="b%20&%20%3Cc%3E\.txt">b &amp; &lt;c&gt;\.txt<\/a>/);
   assert.doesNotMatch(html, /hidden/);
-  assert.equal((await get(`${url}files/b%20%26%20%3Cc%3E.txt`)).body.toString(), 'beta\n');
+  if (process.platform === 'win32') {
+    assert.match(html, /<a href="b%20&%20c\.txt">b &amp; c\.txt<\/a>/);
+    assert.equal((await get(`${url}files/b%20%26%20c.txt`)).body.toString(), 'beta\n');
+  } else {
+    assert.match(html, /<a href="b%20&%20%3Cc%3E\.txt">b &amp; &lt;c&gt;\.txt<\/a>/);
+    assert.equal((await get(`${url}files/b%20%26%20%3Cc%3E.txt`)).body.toString(), 'beta\n');
+  }
 
   for (const path of ['/.env', '/.git/config', '/files/.hidden', '/missing.html']) {
     assert.equal((await raw(port, path)).status, 404, path);
@@ -141,12 +148,18 @@ test('the built-in server keeps a big file whole and a symlink out of the root',
   symlinkSync(join(outside, 'secret.txt'), join(site, 'leak.txt'));
   symlinkSync(outside, join(site, 'leakdir'));
   symlinkSync(join(site, 'inside.txt'), join(site, 'alias.txt'));
+  writeFileSync(join(site, '.env'), 'SECRET=1\n');
+  symlinkSync(join(site, '.env'), join(site, 'public.txt'));
+  symlinkSync('.git', join(site, 'gitlink'));
+  box.site({ '.git/config': '[core]\n' }, 'site');
   writeFileSync(join(site, 'big.bin'), '');
   truncateSync(join(site, 'big.bin'), 30 * 1024 * 1024);
   const { proc, url, port } = await foreground(box, site);
   assert.equal((await raw(port, '/leak.txt')).status, 404);
   assert.equal((await raw(port, '/leakdir/secret.txt')).status, 404);
   assert.equal((await get(`${url}alias.txt`)).body.toString(), 'inside\n');
+  assert.equal((await raw(port, '/public.txt')).status, 404);
+  assert.equal((await raw(port, '/gitlink/config')).status, 404);
   const big = await raw(port, '/big.bin', 'HEAD');
   assert.equal(big.headers['content-length'], String(30 * 1024 * 1024));
   proc.child.kill();

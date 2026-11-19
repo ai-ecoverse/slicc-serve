@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 import { root, scratch } from './helpers.mjs';
 
 test('AGENTS.md stays within 1000 characters and there is no CLAUDE.md', () => {
@@ -18,7 +19,7 @@ test('npm-stage builds the main package with slicc.commands and the platform pac
     [
       '--input-type=module',
       '-e',
-      `import { TARGETS, assetName } from ${JSON.stringify(join(root, 'scripts', 'targets.mjs'))}; console.log(JSON.stringify(TARGETS.map(assetName)))`,
+      `import { TARGETS, assetName } from ${JSON.stringify(pathToFileURL(join(root, 'scripts', 'targets.mjs')).href)}; console.log(JSON.stringify(TARGETS.map(assetName)))`,
     ],
     { encoding: 'utf8' }
   );
