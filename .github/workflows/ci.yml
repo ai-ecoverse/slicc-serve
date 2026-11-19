@@ -1,0 +1,269 @@
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  actions: read
+  issues: write
+  pull-requests: write
+  statuses: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    uses: ai-ecoverse/slicc-shared-web/.github/workflows/pipeline.yml@v2.16.0
+    secrets: inherit
+    with:
+      lint: rustup toolchain install && npm run lint
+      test: rustup toolchain install && npm run test:ci
+      windows-test: rustup toolchain install; npm run test:windows
+      test-glob: test/integration/*.test.mjs
+      shards: 2
+      timeout-minutes: 30
+      review-prompt: |
+        SLICC-SERVE
+
+        This repository is slicc-serve: `scserve` on macOS, Linux and Windows, and `serve` and `scserve` in SLICC's kernel (`bin/serve.wasm`, `slicc.commands` with `abi: wasi`), which publish a directory (with the built-in static server) or a server on 127.0.0.1 at a public capability URL through the SLICC tray hub. On a host, a detached relay process holds the tray's controller WebSocket and answers the hub's `preview.request` with HTTP GETs to the local origin. It ships the native binaries, `serve.wasm`, `SHA256SUMS`, `install.sh` and `install.ps1` on the GitHub release, and `@ai-ecoverse/slicc-serve` with its six platform packages. AGENTS.md and the README are the contract.
+
+        Once this pull request passes the merge queue, semantic-release tags it and the jobs after `released` in ci.yml build, sign, attest and publish it. Review it as the last check before it ships.
+
+        Look for real defects, in this order:
+        1. Exposure: the static server never serves outside its root (`..`, encoded separators, symlinks out, hidden files), the relay answers only for the served root it registered, the control socket and `tray.json` stay private to the user, and the tray's controller token never goes to another origin.
+        2. The hub contract: the README's handling of 3xx, 401/403, 402/429, 404/410, other 4xx and 5xx from every hub call and from the controller WebSocket upgrade; the wire shapes of `preview.request`/`preview.response` (64 KiB chunks, base64 for binary and every 206, the 25 MiB and 8 MiB limits) and the mint, upload, finalize, stop and list calls.
+        3. Consumers: the CLI's flags, output and exit codes (0, 1, 2, 3 sign-in, 4 quota), release asset names, `SHA256SUMS`, the installers and the npm packages.
+        4. Tests: every behaviour change has an integration test in `test/integration/` that drives the real CLI against `fake-hub.mjs`, and a fix's test fails without the fix. Nothing contacts the real hub.
+        5. Repo rules: no comments anywhere, no unit tests in git, and a conventional-commit title.
+
+        Build with `cargo build -p serve` and `npm run build:wasm`, then run one file with `node --test test/integration/<file>.test.mjs`. Don't report style preferences, or anything you haven't confirmed.
+
+        Deny for a confirmed exposure of files outside the served root or of a capability, a broken release asset or package, a crash or regression in a common command without a workaround, or a behaviour change without its test. Comment on and approve a narrow problem with a workaround.
+
+  macos:
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      LEFTHOOK: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - run: rustup toolchain install && npm run test:ci
+
+  native-check:
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    name: native-check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, targets: 'x86_64-pc-windows-msvc aarch64-pc-windows-msvc' }
+          - { os: macos-latest, targets: 'x86_64-apple-darwin aarch64-apple-darwin' }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      TARGETS: ${{ matrix.targets }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - run: |
+          rustup toolchain install
+          for target in $TARGETS; do rustup target add "$target"; done
+
+      - run: |
+          for target in $TARGETS; do cargo check --locked --workspace --target "$target"; done
+
+  released:
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - id: version
+        run: |
+          git fetch --tags --force --quiet origin
+          version=$(git tag --points-at HEAD --list 'v*' | sed 's/^v//' | sort -V | tail -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release: ${version:-none} at $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  binaries:
+    needs: released
+    if: needs.released.outputs.version != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: darwin, os: macos-latest, builds: 'aarch64-apple-darwin:scserve:scserve-darwin-arm64 x86_64-apple-darwin:scserve:scserve-darwin-amd64' }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, builds: 'aarch64-unknown-linux-musl:scserve:scserve-linux-arm64' }
+          - { name: linux-amd64, os: ubuntu-latest, builds: 'x86_64-unknown-linux-musl:scserve:scserve-linux-amd64' }
+          - { name: windows-arm64, os: windows-11-arm, builds: 'aarch64-pc-windows-msvc:scserve.exe:scserve-windows-arm64.exe' }
+          - { name: windows-amd64, os: windows-latest, builds: 'x86_64-pc-windows-msvc:scserve.exe:scserve-windows-amd64.exe' }
+          - { name: wasm, os: ubuntu-latest, builds: 'wasm32-wasip1:scserve.wasm:serve.wasm' }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      SCSERVE_VERSION: ${{ needs.released.outputs.version }}
+      BUILDS: ${{ matrix.builds }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install
+          for build in $BUILDS; do rustup target add "${build%%:*}"; done
+
+      - if: contains(matrix.builds, 'musl')
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+
+      - name: Build
+        run: |
+          mkdir -p out
+          for build in $BUILDS; do
+            IFS=: read -r target file asset <<< "$build"
+            cargo build --release --locked --target "$target" -p serve
+            cp "target/$target/release/$file" "out/$asset"
+          done
+
+      - name: Sign and notarize the darwin binaries
+        if: matrix.name == 'darwin'
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY_ISSUER_ID: ${{ secrets.APPLE_API_KEY_ISSUER_ID }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          scripts/sign-macos.sh out/scserve-darwin-arm64 out/scserve-darwin-amd64
+          if [ -n "${APPLE_CERTIFICATE_BASE64:-}" ]; then
+            for bin in out/scserve-darwin-arm64 out/scserve-darwin-amd64; do
+              codesign -dv --verbose=2 "$bin" 2>&1 | grep -q 'Authority=Developer ID Application' || { echo "::error::$bin is not signed with a Developer ID"; exit 1; }
+            done
+          fi
+
+      - name: Check the version
+        if: matrix.name != 'wasm'
+        run: |
+          first="${BUILDS%% *}"
+          test "$("out/${first##*:}" --version)" = "$SCSERVE_VERSION"
+
+      - name: Linux binaries are static
+        if: contains(matrix.builds, 'musl')
+        run: |
+          for f in out/scserve-linux-*; do
+            info=$(file "$f")
+            printf '%s: %s\n' "$f" "$info"
+            echo "$info" | grep -qi 'static' || { echo "::error::$f is not statically linked"; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: scserve-${{ matrix.name }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+
+  assets:
+    needs: [released, binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      LEFTHOOK: '0'
+      VERSION: ${{ needs.released.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 26
+          cache: npm
+
+      - run: npm ci
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: scserve-*
+          path: artifacts/build
+
+      - run: node scripts/release-collect.mjs --version "$VERSION"
+
+      - run: node scripts/npm-stage.mjs --version "$VERSION"
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-checksums: artifacts/release/SHA256SUMS
+
+      - name: Upload the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd artifacts/release
+          gh release upload "v$VERSION" scserve-* serve.wasm SHA256SUMS#SHA256SUMS "../../install.sh#install.sh" "../../install.ps1#install.ps1" --clobber --repo "$GITHUB_REPOSITORY"
+          uploaded=$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+          for name in scserve-* serve.wasm SHA256SUMS install.sh install.ps1; do
+            printf '%s\n' "$uploaded" | grep -qx "$name" || { echo "::error::$name is not on v$VERSION"; exit 1; }
+          done
+
+      - name: Publish the draft release as latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "v$VERSION" --draft=false --latest --repo "$GITHUB_REPOSITORY"
+
+      - name: Install through the published install.sh
+        run: |
+          curl -fsSL https://github.com/ai-ecoverse/slicc-serve/releases/latest/download/install.sh | sh -s -- --dir "$RUNNER_TEMP/bin"
+          test "$("$RUNNER_TEMP/bin/scserve" --version)" = "$VERSION"
+
+      - run: node scripts/npm-publish.mjs

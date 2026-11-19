@@ -1,0 +1,42 @@
+#!/usr/bin/env node
+import { createHash } from 'node:crypto';
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseArgs } from 'node:util';
+import { assetName, TARGETS } from './targets.mjs';
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const { values } = parseArgs({
+  options: {
+    version: { type: 'string' },
+    from: { type: 'string', default: join(root, 'artifacts', 'build') },
+    out: { type: 'string', default: join(root, 'artifacts', 'release') },
+    'skip-missing': { type: 'boolean', default: false },
+  },
+});
+if (!values.version) {
+  process.stderr.write('usage: release-collect.mjs --version <semver> [--from dir] [--out dir]\n');
+  process.exit(2);
+}
+
+rmSync(values.out, { recursive: true, force: true });
+mkdirSync(values.out, { recursive: true });
+const assets = [...TARGETS.map(assetName), 'serve.wasm'];
+const sums = [];
+const found = new Map(
+  readdirSync(values.from, { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => [entry.name, join(entry.parentPath, entry.name)])
+);
+for (const asset of assets) {
+  const source = found.get(asset);
+  if (!source) {
+    if (values['skip-missing']) continue;
+    throw new Error(`missing ${asset} in ${values.from}`);
+  }
+  copyFileSync(source, join(values.out, asset));
+  sums.push(`${createHash('sha256').update(readFileSync(source)).digest('hex')}  ${asset}`);
+}
+writeFileSync(join(values.out, 'SHA256SUMS'), `${sums.join('\n')}\n`);
+process.stdout.write(`collected ${sums.length} assets for ${values.version} in ${values.out}\n`);
