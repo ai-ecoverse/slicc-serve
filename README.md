@@ -2,7 +2,7 @@
 
 `scserve` publishes a directory, or a server that already runs on this machine, at a public capability URL on `sliccy.now`, through the SLICC tray hub. It is slicc 6's `serve` for any host: `scserve ./dist` prints `https://<label>.sliccy.now/` and returns, and anyone with the URL sees the files, pulled from this machine on demand while it is online. `scserve --port 5173` does the same for vite, `python -m http.server` or any other local server, and `scserve --ttl 7d ./dist` uploads an immutable snapshot that stays up without this machine.
 
-In SLICC the same program is `serve` and `scserve` (`bin/serve.wasm`). There it serves a directory on the kernel's loopback with `--local` today; publishing from SLICC goes through seven's page and comes later (see [In SLICC](#in-slicc)).
+In SLICC the same program is `serve` and `scserve` (`bin/serve.wasm`). There it serves the directory on the kernel's loopback, and seven's page, which already leads a tray on the same hub, publishes it: `serve` asks the page over `/dev/embedder` (see [In SLICC](#in-slicc)).
 
 This README is the spec. The plan is [#1](https://github.com/ai-ecoverse/slicc-serve/issues/1).
 
@@ -34,7 +34,7 @@ Binaries: macOS (arm64, x86-64, signed and notarized), Linux (arm64, x86-64, sta
 scserve [--entry FILE] [--ttl DURATION] [--local] [--foreground] [--open] [--json] DIRECTORY
 scserve --port PORT [--entry PATH] [--local] [--foreground] [--open] [--json]
 scserve --list [--json]
-scserve --stop TOKEN|URL [--json]
+scserve --stop TOKEN|URL|PORT [--json]
 scserve --version | --upgrade | --help
 ```
 
@@ -49,7 +49,7 @@ scserve --version | --upgrade | --help
 | `--open` | opens the URL with the platform's opener once it is published (and a sign-in page, see [The tray hub](#the-tray-hub)) |
 | `--json` | prints the result, or the error, as one JSON object (an array for `--list`) |
 | `--list` | lists the previews this machine published |
-| `--stop TOKEN\|URL` | stops a preview, by its token, its public URL or its local URL |
+| `--stop TOKEN\|URL\|PORT` | stops a preview, by its token, its public URL, its local URL or its local port |
 | `--version` | prints the version alone (`1.2.0`) |
 | `--upgrade` | see [`--upgrade`](#--upgrade) |
 | `-h`, `--help` | prints the usage and the options to stdout and exits 0, wherever it appears among the options |
@@ -122,7 +122,7 @@ The hub sends `preview.request {reqId, servedRoot, vfsPath, asText, range?}`; th
 
 `--list` asks the hub for the previews of this machine's tray (and of [retired trays](#state) that still hold snapshots), joins them with the local records, and prints `TOKEN MODE EXPIRES URL ROOT`: `live`, `snapshot`, `uploading` or `local`, `(foreground)` for an attached one. Records whose relay is gone, snapshots past their expiry and previews the hub no longer has are dropped. `no previews` when there are none.
 
-`--stop` takes a preview token, a public URL (its host encodes the token, as slicc 6's `previewTokenFromUrl` reads it), a local URL or a record id. A hub preview is stopped with the tray that minted it (`POST /api/tray/<trayId>/preview/stop`); the relay then gets `preview.revoked` and stops its server. A local preview is stopped through the relay. It prints `stopped <token or URL>`; `scserve: no preview matches X`, `scserve: <token> is not a preview of this machine's trays` and `scserve: the tray hub has no preview <token> (already stopped or expired)` exit 1.
+`--stop` takes a preview token, a public URL (its host encodes the token, as slicc 6's `previewTokenFromUrl` reads it), a local URL, a port or a record id. A local URL matches by its port when its host is a loopback name (`127.0.0.1`, any `127.x.y.z`, `localhost`, `*.localhost`), so `http://localhost:61489/` and `61489` both stop the preview served on `127.0.0.1:61489`; a port matches a preview's static server or the server a `--port` preview publishes. When several previews match, it stops none and exits 1 with `scserve: X matches N previews; stop one by its token`. A hub preview is stopped with the tray that minted it (`POST /api/tray/<trayId>/preview/stop`); the relay then gets `preview.revoked` and stops its server. A local preview is stopped through the relay. It prints `stopped <token or URL>`; `scserve: no preview matches X`, `scserve: <token> is not a preview of this machine's trays` and `scserve: the tray hub has no preview <token> (already stopped or expired)` exit 1.
 
 ## The tray hub
 
@@ -180,15 +180,103 @@ A `scserve` from the installers downloads the latest `install.sh` (`install.ps1`
 
 ## In SLICC
 
-`serve.wasm` is built from the same crates for `wasm32-wasip1`, with `serve-core` (arguments, the static server, the snapshot walker, the records) shared with the host build and `wasix-net`'s sockets on the kernel's loopback. The kernel runs it as `serve` or `scserve`, and it names itself after the command it runs as.
+`serve.wasm` is built from the same crates for `wasm32-wasip1-threads`, with `serve-core` (arguments, the static server, the records) shared with the host build and `wasix-net`'s sockets on the kernel's loopback. The kernel runs it as `serve` or `scserve`, and it names itself after the command it runs as. The package's `engines` asks for `slicc-kernel >=1.153.0` (the kernel with `/dev/embedder`), so an older kernel refuses to install its commands; one without the device anyway prints `serve: /dev/embedder not available (needs slicc-kernel >= 1.153.0)` and exits 1 for everything that needs the page, while `--local`, `--version`, `--help`, `--upgrade` and the usage errors work.
 
-Today, in SLICC:
+The options, the output, `--json` and the exit status are the host's, with `serve` for `scserve` in every message. The differences:
 
-- `serve --local DIR` runs the static server on the kernel's loopback in the foreground and prints `http://<port>.kernel.localhost/` (from `SLICC_PAGE_LOOPBACK_URL`, else `http://127.0.0.1:<port>/`); `serve --local --port PORT` prints that URL for a server that already runs.
-- `--version`, `--help` and the usage errors behave as on a host; `--upgrade` prints `pnpm add -g @ai-ecoverse/slicc-serve@latest`.
-- Everything that publishes exits 1 with `serve: publishing from SLICC needs seven's serve.publish, which isn't there yet; only --local works in SLICC so far`.
+- **Who publishes:** seven's page, which leads a tray on the tray hub already. `serve` never talks to the hub: it asks the page with the [embedder kinds](#the-embedder-contract) below, and the page mints the preview and relays the hub's `preview.request` to `kernel.loopbackFetch`.
+- **Local URLs** are the page's names for the kernel's loopback: `http://<port>.kernel.localhost/` (from `SLICC_PAGE_LOOPBACK_URL`, else `http://127.0.0.1:<port>/`).
+- **`--ttl`** exits 1 with `serve: --ttl from SLICC needs seven's serve.snapshot, which isn't there yet` ([#4](https://github.com/ai-ecoverse/slicc-serve/issues/4)).
+- **`--open`** asks the page for a tab with `open.url` (as [slicc-open](https://github.com/ai-ecoverse/slicc-open) does) once the URL is printed; a refusal prints `serve: <the page's message>` and leaves the exit status alone.
+- **`--upgrade`** prints `pnpm add -g @ai-ecoverse/slicc-serve@latest`.
 
-Publishing from seven goes through seven's page, which already leads a tray on the same hub: `serve` asks over `/dev/embedder` (`serve.publish`, `serve.snapshot`, `serve.list`, `serve.stop`), and the page relays `preview.request` to `kernel.loopbackFetch`. That is [#1](https://github.com/ai-ecoverse/slicc-serve/issues/1)'s M3 and M4, tracked in this repo's issues together with slicc-bios's side.
+### What runs where in SLICC
+
+```
+serve DIR ──spawn──► serve (background, one per preview)
+                       ├─ static server on the kernel's 127.0.0.1:<random>
+                       └─ /dev/embedder: serve.publish, held open ──► seven's page ──► tray hub ◄── visitor
+                                           page: preview.request ──kernel.loopbackFetch──► 127.0.0.1:<port>
+```
+
+- **Detached:** `serve DIR` checks the directory and `--entry`, then starts a background `serve` (the same program, spawned with WASIX `proc_spawn`, standard input on `/dev/null`, standard error appended to `<state>/serve.log`, standard output on a pipe back to it) and waits. The background `serve` binds the static server, sends `serve.publish`, and writes one line back: the record, or what failed. The foreground `serve` prints it the way the host does and exits; the background one keeps the server and the request open. There is one background `serve` per preview and no relay: the page holds the tray.
+- **The request is the preview.** The background `serve` blocks reading the `serve.publish` reply. When that process ends, for whatever reason (`serve --stop`, `kill`, its session torn down, a crash), the kernel aborts the request and the page revokes the preview on the hub. When the page ends the reply (the user stopped it in seven, the hub revoked it, seven lost its tray), the background `serve` stops its server, removes its record and exits.
+- **`--port PORT`** publishes a server that already runs on the kernel's loopback: the background `serve` holds only the request. `serve: nothing answers on 127.0.0.1:PORT yet` warns as on a host.
+- **`--foreground`** does all of it in the `serve` process itself: it prints the URL, logs each request of the static server (`serve: GET /app.js 200 1234`), and Ctrl-C (or the end of the process) ends the request, which revokes the preview. When the page ends the reply, it prints `serve: stopped: <reason>` and exits 0.
+- **`--local DIR`** starts a background `serve` with the static server only, recorded as `local` (listed, stopped with `--stop`); `--local --foreground DIR` serves in the foreground; `--local --port PORT` prints the URL only. None of them asks the page.
+- **`--list`** asks the page with `serve.list` and joins its answer with the records, as the host joins the hub's list: `TOKEN MODE EXPIRES URL ROOT`, `(foreground)` for an attached one. A record whose process is gone is dropped, and so is one whose token the page doesn't list (its process is stopped). `local` records need no page.
+- **`--stop`** matches its argument against the records as on a host (token, public URL, local URL, port or record id). A public preview is stopped with `serve.stop`; a token or a public URL that matches no record is sent to the page all the same. Then the matching record's process gets `SIGTERM` and the record is removed. A local preview is only signalled. It prints `stopped <token or local URL>`.
+- **State** is the host's layout in the kernel's file system: `<state>/previews/<id>.json` (`0600`) per preview, with the background process's pid, and `<state>/serve.log`, where `<state>` is `$SCSERVE_STATE_DIR`, else `$XDG_STATE_HOME/slicc/serve`, else `~/.local/state/slicc/serve`. There is no `tray.json` and no relay.
+
+### Errors from the page
+
+A request the page refuses fails with the kernel's errno, and `serve` prints `serve: <the first line of the page's message>` (the errno's text when there is none) and exits 1:
+
+| errno | what it means | what `serve` adds |
+| --- | --- | --- |
+| `EACCES` | the user dismissed the prompt or didn't answer it, public previews are switched off, another request is waiting | `serve: if seven asked, answer in seven's tab (a click allows it), then run serve again` |
+| `ENOTSUP` | no page answers for this session (`no page answers requests for this session`: a follower, a headless kernel), or a seven that doesn't answer the kind yet (`this embedder does not answer serve.publish`) | |
+| `ENOENT` | `serve.stop`: the page holds no such preview | |
+| `EBUSY`, `EIO`, any other | the page failed (`EIO` for an unreachable hub too) | |
+
+A failure the tray hub answered comes as the reply's first line instead (`{"error", "status", …}`, below) and maps the way the host maps the hub's answers: `401` and `403`, or a `signIn`, exit 3 (`serve: publishing: the tray hub refused it (403: …)`, `serve: sign in at <url>`); `402` and `429` exit 4 (`serve: publishing: the tray hub's limit is reached (429: …)`, `serve: retry after 30 s`); any other status exits 1 (`serve: publishing: the tray hub answered 400: …`). `--json` prints the failure as `{"ok":false,"exit":N,"lines":[…],"signIn":URL|null}`, as on a host.
+
+### The embedder contract
+
+This is what seven's page answers ([#6](https://github.com/ai-ecoverse/slicc-serve/issues/6)); `serve`'s tests run against a fake page that answers the same in a node kernel. Each request is one open of `/dev/embedder` (slicc-kernel 1.153.0 and later): a JSON header line `{"kind": …, …options}`, no body, then the reply until end-of-file. Option values are JSON, so no path or URL can break the header.
+
+| kind | options | opened | reply | errors |
+| --- | --- | --- | --- | --- |
+| `serve.publish` | `port`, `root`, `entry`, `allowLive` | `O_RDWR` | one JSON line, `{"url","previewToken",…}` or `{"error",…}`; then held open until the preview ends, optionally one `{"stopped"}` line, then end-of-file | `EACCES`, `ENOTSUP`, `EIO` |
+| `serve.list` | none | `O_RDWR` | one JSON line per preview, then end-of-file; nothing when there are none | `ENOTSUP`, `EIO` |
+| `serve.stop` | `previewToken` | `O_WRONLY` | none; the close returns the errno | `ENOENT`, `ENOTSUP`, `EIO` |
+
+#### `serve.publish`
+
+```
+{"kind":"serve.publish","port":32768,"root":"/home/me/site","allowLive":false}
+{"kind":"serve.publish","port":5173,"entry":"app/index.html","allowLive":true}
+```
+
+| option | |
+| --- | --- |
+| `port` | number, 1 to 65535: the origin on the kernel's loopback, which the page reaches with `kernel.loopbackFetch(…, {port})` |
+| `root` | string: the directory's absolute path in the kernel, for the prompt and the chip only; absent with `--port`. The page never reads files: every visit goes to `port` |
+| `entry` | string, absent without `--entry`: the `--entry` path as `serve` normalized it (segments joined by `/`; no empty, `.` or `..` segment; no leading `/`; no `\`, `:` or NUL). The page refuses anything else with `NotAllowedError` `invalid entry` |
+| `allowLive` | boolean: `true` for `--port` (the hub doesn't edge-cache it), `false` for a directory (the hub's 5 s edge cache) |
+
+What the page does, in order:
+
+1. **Who may publish:** a follower, or a page that leads no tray right now, throws `NotSupportedError` (`ENOTSUP`), for example `seven isn't connected to the tray hub`. The switch "Public previews" off throws `NotAllowedError` (`EACCES`) `public previews are switched off in seven's settings`.
+2. **The prompt:** unless the stamp says `serve` was typed in seven's terminal with a gesture still active (bios's `typed(stamp)`), the page asks: "Publish /home/me/site at a public URL?" (or "the server on port 5173"). Cancel, 60 s without an answer, or a second request of the same session while one is up, throws `NotAllowedError` with what happened (`the request to publish was dismissed`, `nobody answered the request to publish within 60 s`, `another request is waiting for you`); `serve` prints the message as it is.
+3. **The mint:** `POST /api/tray/<trayId>/preview` `{servedRoot, entryPath, allowLive}`, where `servedRoot` is `/srv/serve/<id>` with a fresh 16-hex-digit `<id>` from `crypto.getRandomValues` for each request (never the real path, never the port: ports are reused), and `entryPath` is `<servedRoot>/<entry>`, or `<servedRoot>/index.html` without `entry` (the hub rejects `<servedRoot>/`).
+4. **A hub failure** is the reply, not an errno: one line `{"error": <the hub's error, or the status text>, "status": <its HTTP status>, "code": <its code, when it has one>, "retryAfter": <its Retry-After, when present>, "signIn": <a sign-in URL, when the hub named one>}`, then end-of-file. A hub the page can't reach at all is an error (`EIO`) with the reason.
+5. **Registered:** the page keeps `servedRoot → {port, entryPath, entryIsRoot: entry absent, previewToken, url, root, entry, createdAt, uid: stamp.uid}` and answers `{"url": <the hub's url, unchanged>, "previewToken": …, "trayId": …, "createdAt": <ISO 8601>}` and a newline. `serve` prints the URL with a trailing `index.html` dropped when there is no `entry`.
+6. **Held open:** the page's reply stream stays open, with nothing more in it, as long as the preview is live. The page shows the live chip ("Serving publicly … Stop").
+
+How it ends:
+
+- **From the command's side:** the kernel aborts the handler's `signal` (reason `closed` when the description is closed or its process ends, `interrupted` when a signal reaches the blocked read) and cancels the reply stream. On either, the page revokes the preview on the hub (`POST /api/tray/<trayId>/preview/stop {previewToken}`) and drops it from the registry. If the signal is already aborted when the mint answers (the process went away during the prompt or the mint), the page revokes at once and replies nothing.
+- **From the page's side** (the chip's Stop, `serve.stop`, `preview.revoked` from the hub, the switch turned off, the tray lost): the page revokes it on the hub unless the hub revoked it, drops it, writes `{"stopped": <reason>}` and a newline (`stopped in seven`, `stopped with serve --stop`, `revoked by the tray hub`, `public previews were switched off`, `seven lost its tray`), and closes the stream. `serve` treats end-of-file with or without that line the same way.
+- **A reload** ends the kernel, and every process with it: on boot, and after each leader reconnect, the page revokes the tray's live previews it holds no registration for, as the host relay does.
+
+The relay itself (`preview.request` → `kernel.loopbackFetch(GET <path>, {port, headers: {range}})` → `preview.response` chunks) follows [The relay's answers](#the-relays-answers), with `vfsPath` checked against the registered `servedRoot`, the path under it sent as it came, and the `entryPath` of a preview without `entry` sent as `/`.
+
+#### `serve.list`
+
+```
+{"kind":"serve.list"}
+```
+
+The reply is one JSON object per line for each preview the page holds from `serve.publish` that the caller may see: those whose publishing process had the caller's uid, all of them for root. `{"previewToken", "url", "root", "port", "entry", "createdAt"}`, with `root` and `entry` absent as in the request. An empty reply means none.
+
+#### `serve.stop`
+
+```
+{"kind":"serve.stop","previewToken":"0f3c….a91e…"}
+```
+
+The page revokes the preview on the hub, drops it, and ends its `serve.publish` reply with `{"stopped":"stopped with serve --stop"}`, so the background `serve` that holds it exits. A preview the page doesn't hold from `serve.publish`, or one of another uid for a caller that isn't root, throws `NotFoundError` (`ENOENT`) `seven holds no preview <token>`.
 
 ## Development
 
