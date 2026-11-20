@@ -268,7 +268,7 @@ The relay itself (`preview.request` → `kernel.loopbackFetch(GET <path>, {port,
 {"kind":"serve.list"}
 ```
 
-The reply is one JSON object per line for each preview the page holds from `serve.publish` that the caller may see: those whose publishing process had the caller's uid, all of them for root. `{"previewToken", "url", "root", "port", "entry", "since"}`, with `root` and `entry` absent as in the request and `since` the mint's time in milliseconds since the epoch. An empty reply means none.
+The reply is one JSON object per line for each preview the page holds from `serve.publish` that the caller may see: those whose publishing process had the caller's uid, all of them for root. `{"previewToken", "url", "root", "port", "entry", "since"}`, with `root` and `entry` absent as in the request and `since` the mint's time in milliseconds since the epoch, which `serve --list` shows as `createdAt` (ISO 8601) when it has no record of its own. An empty reply means none.
 
 #### `serve.stop`
 
