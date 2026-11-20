@@ -211,6 +211,49 @@ test('snapshots on a tray that was replaced stay listed and stoppable', async ()
   assert.deepEqual(box.tray().retired, []);
 });
 
+test('--ttl keeps a directory under its real path and under each alias that links to it (#10, #11)', {
+  skip: process.platform === 'win32' && 'symlinks need privileges on Windows',
+}, async () => {
+  const box = sandbox(hub);
+  const site = box.site({
+    'index.html': '<a href="v2/page.html">v2</a><script src="assets/app.js"></script>',
+    'v2/page.html': 'page',
+    'assets/app.js': 'app',
+  });
+  symlinkSync('v2', join(site, 'latest'));
+  symlinkSync('assets', join(site, 'a-alias'));
+  symlinkSync('..', join(site, 'v2', 'up'));
+  const res = await box.run(['--ttl', '1h', '--json', site]);
+  assert.equal(res.code, 0, res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.equal(out.files, 5);
+  const p = find(out.previewToken);
+  assert.deepEqual([...p.files.keys()].sort(), [
+    'a-alias/app.js',
+    'assets/app.js',
+    'index.html',
+    'latest/page.html',
+    'v2/page.html',
+  ]);
+  for (const path of ['v2/page.html', 'assets/app.js', 'latest/page.html']) {
+    const got = await hub.visit(new URL(path, out.url).href);
+    assert.equal(got.status, 200, path);
+  }
+});
+
+test('--ttl counts an aliased subtree once per path, so the file limit bounds it', {
+  skip: process.platform === 'win32' && 'symlinks need privileges on Windows',
+}, async () => {
+  const box = sandbox(hub);
+  const files = { 'index.html': 'x' };
+  for (let i = 0; i < 600; i++) files[`data/${i}.txt`] = `${i}`;
+  const site = box.site(files);
+  symlinkSync('data', join(site, 'mirror'));
+  const res = await box.run(['--ttl', '1h', site]);
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /the snapshot exceeds 1000 files/);
+});
+
 test('--ttl leaves out symlinks to hidden files and survives directories that link to each other', {
   skip: process.platform === 'win32' && 'symlinks need privileges on Windows',
 }, async () => {
@@ -230,6 +273,12 @@ test('--ttl leaves out symlinks to hidden files and survives directories that li
   const out = JSON.parse(res.stdout);
   const p = find(out.previewToken);
   const names = [...p.files.keys()].sort();
-  assert.deepEqual(names, ['a/one.txt', 'a/tob/two.txt', 'index.html']);
+  assert.deepEqual(names, [
+    'a/one.txt',
+    'a/tob/two.txt',
+    'b/toa/one.txt',
+    'b/two.txt',
+    'index.html',
+  ]);
   assert.ok(![...p.files.values()].some((f) => f.bytes.toString().includes('SECRET')));
 });
