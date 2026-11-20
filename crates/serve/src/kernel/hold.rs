@@ -147,7 +147,11 @@ fn wait(cmd: &str, held: Held, store: &Store) -> i32 {
     loop {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(_) => {
+                store.remove(&record.id);
+                std::process::exit(1)
+            }
             Ok(_) => {
                 let value: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
                 if let Some(r) = value.get("stopped").and_then(Value::as_str) {
@@ -231,6 +235,8 @@ pub fn detach(cmd: &str, spec: &Spec, opts: &Serve) -> i32 {
     let ops = [
         Op::Null(0),
         Op::Dup2 { src: w, fd: 1 },
+        Op::Close(w),
+        Op::Close(r),
         Op::Append {
             fd: 2,
             path: store.log().to_string_lossy().into_owned(),

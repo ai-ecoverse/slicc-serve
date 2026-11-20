@@ -320,6 +320,17 @@ describe('serve in a kernel with a page', { skip }, () => {
     assert.match(res.stderr, /\nserve: GET \/index\.html 200 11\n/);
     assert.match(res.stderr, /serve: stopped: stopped in seven\n$/);
     assert.deepEqual(await records(), []);
+
+    const again = run(['serve', '--foreground', '--port', String(record.port)]);
+    await eventually(() => page.previews.size === 1, 20_000);
+    const [held] = page.previews.values();
+    await eventually(async () => (await records()).length === 1);
+    const [attached] = await records();
+    await os.sh(`kill -INT ${attached.pid}`);
+    const interrupted = await again;
+    assert.notEqual(interrupted.status, 0);
+    assert.doesNotMatch(interrupted.stderr, /stopped:/);
+    await eventually(() => held.ended?.startsWith('revoked'), 20_000);
   });
 
   it('opens the URL with open.url for --open', async () => {

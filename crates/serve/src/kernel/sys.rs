@@ -96,6 +96,7 @@ pub fn file(fd: u32) -> File {
 }
 
 pub enum Op {
+    Close(u32),
     Null(u32),
     Dup2 { src: u32, fd: u32 },
     Append { fd: u32, path: String },
@@ -112,7 +113,7 @@ pub fn spawn(argv: &[String], ops: &[Op]) -> io::Result<u32> {
         .map(|op| match op {
             Op::Null(_) => "/dev/null".to_string(),
             Op::Append { path, .. } => path.clone(),
-            Op::Dup2 { .. } => String::new(),
+            Op::Dup2 { .. } | Op::Close(_) => String::new(),
         })
         .collect();
     let mut table = vec![0u8; OP_SIZE * ops.len()];
@@ -120,6 +121,7 @@ pub fn spawn(argv: &[String], ops: &[Op]) -> io::Result<u32> {
         let slot = &mut table[i * OP_SIZE..(i + 1) * OP_SIZE];
         let path = &paths[i];
         let (cmd, fd, src) = match op {
+            Op::Close(fd) => (0u8, *fd, 0),
             Op::Null(fd) => (2u8, *fd, 0),
             Op::Dup2 { src, fd } => (1u8, *fd, *src),
             Op::Append { fd, .. } => (2u8, *fd, 0),
