@@ -396,9 +396,16 @@ describe('serve in a kernel with a page', { skip }, () => {
   it("maps the tray hub's failures to exits 1, 3 and 4", async () => {
     const cases = [
       [
-        { error: 'too many', status: 429, code: 'LIVE_PREVIEW_LIMIT', retryAfter: '30' },
+        {
+          error: 'too many',
+          status: 429,
+          code: 'LIVE_PREVIEW_LIMIT',
+          retryAfter: '30',
+          active: 200,
+          limit: 200,
+        },
         4,
-        "serve: publishing: the tray hub's limit is reached (429: too many; list them with `serve --list` and stop the ones you no longer need with `serve --stop <token>`)\nserve: retry after 30 s\n",
+        "serve: publishing: the tray hub's limit is reached (429: too many (200 of 200 live previews in use); list them with `serve --list` and stop the ones you no longer need with `serve --stop <token>`)\nserve: retry after 30 s\n",
       ],
       [
         {
