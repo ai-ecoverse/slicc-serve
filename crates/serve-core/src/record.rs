@@ -39,13 +39,70 @@ impl Record {
     }
 
     pub fn matches(&self, target: &str) -> bool {
+        if self.id == target || self.preview_token.as_deref() == Some(target) {
+            return true;
+        }
+        if let Some(port) = loopback_port(target) {
+            return self.port == Some(port);
+        }
         let trimmed = target.trim_end_matches('/');
-        self.id == target
-            || self.preview_token.as_deref() == Some(target)
-            || [self.url.as_deref(), self.local_url.as_deref()]
-                .into_iter()
-                .flatten()
-                .any(|u| u.trim_end_matches('/') == trimmed || origin(u) == origin(target))
+        [self.url.as_deref(), self.local_url.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|u| u.trim_end_matches('/') == trimmed || origin(u) == origin(target))
+    }
+}
+
+pub enum Found {
+    None,
+    One(Box<Record>),
+    Many(usize),
+}
+
+pub fn find(records: Vec<Record>, target: &str) -> Found {
+    let mut hits: Vec<Record> = records.into_iter().filter(|r| r.matches(target)).collect();
+    match hits.len() {
+        0 => Found::None,
+        1 => Found::One(Box::new(hits.remove(0))),
+        n => Found::Many(n),
+    }
+}
+
+fn port_number(text: &str) -> Option<u16> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<u16>().ok().filter(|p| *p > 0)
+}
+
+pub fn loopback_port(target: &str) -> Option<u16> {
+    if let Some(port) = port_number(target) {
+        return Some(port);
+    }
+    let rest = target.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit('@').next()?;
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let host = host.to_ascii_lowercase();
+    let host = host.trim_end_matches('.');
+    let loopback = host == "localhost"
+        || host.ends_with(".localhost")
+        || host.strip_prefix("127.").is_some_and(|r| {
+            r.split('.').count() == 3 && r.split('.').all(|o| o.parse::<u8>().is_ok())
+        });
+    if !loopback {
+        return None;
+    }
+    match port {
+        Some(port) => port_number(port),
+        None => host
+            .split('.')
+            .next()
+            .and_then(port_number)
+            .filter(|_| host.ends_with(".localhost")),
     }
 }
 

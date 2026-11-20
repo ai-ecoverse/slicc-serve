@@ -8,6 +8,7 @@ pub mod record;
 pub mod safe;
 pub mod server;
 pub mod snapshot;
+pub mod table;
 pub mod time;
 pub mod token;
 

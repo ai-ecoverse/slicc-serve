@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -212,6 +212,7 @@ test('--local --port prints the URL of a server that already runs', async () => 
   const out = JSON.parse(res.stdout);
   assert.equal(out.localUrl, 'http://127.0.0.1:9/app/index.html');
   assert.equal(out.mode, 'local');
+  assert.match(out.createdAt, /^\d{4}-\d\d-\d\dT/);
   assert.match(res.stderr, /nothing answers on 127\.0\.0\.1:9 yet/);
   assert.equal(box.relay(), null);
 });
@@ -225,4 +226,40 @@ test('--stop of something unknown exits 1', async () => {
   assert.equal(res.code, 1);
   assert.match(res.stderr, /is not a preview of this machine's trays/);
   assert.equal(JSON.parse(res.stdout).exit, 1);
+});
+
+test('--stop takes the port of a local preview, or its URL on any loopback name', async () => {
+  const box = sandbox();
+  const urls = [];
+  for (const name of ['one', 'two']) {
+    const res = await box.run(['--local', box.site({ 'index.html': name }, name)]);
+    assert.equal(res.code, 0, res.stderr);
+    urls.push(res.stdout.trim());
+  }
+  const ports = urls.map((url) => new URL(url).port);
+  const relay = box.relay();
+  let stop = await box.run(['--stop', ports[0]]);
+  assert.equal(stop.code, 0, stop.stderr);
+  assert.equal(stop.stdout, `stopped ${urls[0]}\n`);
+  stop = await box.run(['--stop', `http://localhost:${ports[1]}/index.html`, '--json']);
+  assert.equal(stop.code, 0, stop.stderr);
+  assert.deepEqual(JSON.parse(stop.stdout), { stopped: urls[1] });
+  assert.equal((await box.run(['--list'])).stdout, 'no previews\n');
+  await eventually(() => !alive(relay.pid), 15_000);
+});
+
+test('--stop refuses a port that matches several previews', async () => {
+  const box = sandbox();
+  const records = join(box.stateDir, 'previews');
+  mkdirSync(records, { recursive: true });
+  for (const id of ['a1', 'b2']) {
+    writeFileSync(
+      join(records, `${id}.json`),
+      JSON.stringify({ id, mode: 'local', port: 5173, createdAt: '2026-01-01T00:00:00.000Z' })
+    );
+  }
+  const res = await box.run(['--stop', '5173']);
+  assert.equal(res.code, 1);
+  assert.equal(res.stderr, 'scserve: 5173 matches 2 previews; stop one by its token\n');
+  assert.deepEqual(readdirSync(records).sort(), ['a1.json', 'b2.json']);
 });

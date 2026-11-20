@@ -3,7 +3,7 @@ use crate::MAX_TTL_MS;
 pub const USAGE: &str = "usage: scserve [--entry FILE] [--ttl DURATION] [--local] [--foreground] [--open] [--json] DIRECTORY
        scserve --port PORT [--entry PATH] [--local] [--foreground] [--open] [--json]
        scserve --list [--json]
-       scserve --stop TOKEN|URL [--json]
+       scserve --stop TOKEN|URL|PORT [--json]
        scserve --version | --upgrade | --help
 ";
 
@@ -21,7 +21,7 @@ capability URL on sliccy.now through the SLICC tray hub.
   --open           open the URL with the platform's opener
   --json           print the result as JSON
   --list           list the previews this machine published
-  --stop TOKEN     stop a preview, by token or URL
+  --stop TARGET    stop a preview, by token, URL or port
   --version        print the version
   --upgrade        upgrade scserve in place
   -h, --help       print this help

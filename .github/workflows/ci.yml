@@ -28,12 +28,13 @@ jobs:
       test: rustup toolchain install && npm run test:ci
       windows-test: rustup toolchain install; npm run test:windows
       test-glob: test/integration/*.test.mjs
+      node-version: '26'
       shards: 2
       timeout-minutes: 30
       review-prompt: |
         SLICC-SERVE
 
-        This repository is slicc-serve: `scserve` on macOS, Linux and Windows, and `serve` and `scserve` in SLICC's kernel (`bin/serve.wasm`, `slicc.commands` with `abi: wasi`), which publish a directory (with the built-in static server) or a server on 127.0.0.1 at a public capability URL through the SLICC tray hub. On a host, a detached relay process holds the tray's controller WebSocket and answers the hub's `preview.request` with HTTP GETs to the local origin. It ships the native binaries, `serve.wasm`, `SHA256SUMS`, `install.sh` and `install.ps1` on the GitHub release, and `@ai-ecoverse/slicc-serve` with its six platform packages. AGENTS.md and the README are the contract.
+        This repository is slicc-serve: `scserve` on macOS, Linux and Windows, and `serve` and `scserve` in SLICC's kernel (`bin/serve.wasm`, `slicc.commands` with `abi: wasi`), which publish a directory (with the built-in static server) or a server on 127.0.0.1 at a public capability URL through the SLICC tray hub. On a host, a detached relay process holds the tray's controller WebSocket and answers the hub's `preview.request` with HTTP GETs to the local origin. In SLICC, `serve` never talks to the hub: a background `serve` per preview runs the static server on the kernel's loopback and holds a `serve.publish` request on `/dev/embedder` open, and seven's page mints the preview and relays visits with `kernel.loopbackFetch`; the README's embedder contract is what the page answers. It ships the native binaries, `serve.wasm`, `SHA256SUMS`, `install.sh` and `install.ps1` on the GitHub release, and `@ai-ecoverse/slicc-serve` with its six platform packages. AGENTS.md and the README are the contract.
 
         Once this pull request passes the merge queue, semantic-release tags it and the jobs after `released` in ci.yml build, sign, attest and publish it. Review it as the last check before it ships.
 
@@ -133,7 +134,7 @@ jobs:
           - { name: linux-amd64, os: ubuntu-latest, builds: 'x86_64-unknown-linux-musl:scserve:scserve-linux-amd64' }
           - { name: windows-arm64, os: windows-11-arm, builds: 'aarch64-pc-windows-msvc:scserve.exe:scserve-windows-arm64.exe' }
           - { name: windows-amd64, os: windows-latest, builds: 'x86_64-pc-windows-msvc:scserve.exe:scserve-windows-amd64.exe' }
-          - { name: wasm, os: ubuntu-latest, builds: 'wasm32-wasip1:scserve.wasm:serve.wasm' }
+          - { name: wasm, os: ubuntu-latest, builds: 'wasm32-wasip1-threads:scserve.wasm:serve.wasm' }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions:
