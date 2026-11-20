@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/serve", "crates/serve-core", "crates/serve-hub"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/ai-ecoverse/slicc-serve"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(serve_unit)"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
