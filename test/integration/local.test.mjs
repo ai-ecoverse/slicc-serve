@@ -212,6 +212,7 @@ test('--local --port prints the URL of a server that already runs', async () => 
   const out = JSON.parse(res.stdout);
   assert.equal(out.localUrl, 'http://127.0.0.1:9/app/index.html');
   assert.equal(out.mode, 'local');
+  assert.match(out.createdAt, /^\d{4}-\d\d-\d\dT/);
   assert.match(res.stderr, /nothing answers on 127\.0\.0\.1:9 yet/);
   assert.equal(box.relay(), null);
 });

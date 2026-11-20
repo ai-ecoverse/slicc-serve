@@ -198,6 +198,7 @@ fn serve(opts: &Serve, dirs: &Dirs, out: Out, err: Out) -> i32 {
             mode: "local".into(),
             local_url: Some(url.clone()),
             port: Some(port),
+            created_at: serve_core::time::iso(serve_core::time::now_ms()),
             ..Record::default()
         };
         return done(&record, opts, out, err, None);
@@ -339,6 +340,7 @@ fn foreground_local(dir: &Path, opts: &Serve, out: Out, err: Out) -> i32 {
         port: Some(port),
         entry: opts.entry.clone(),
         foreground: true,
+        created_at: serve_core::time::iso(serve_core::time::now_ms()),
         ..Record::default()
     };
     done(&record, opts, out, err, None);

@@ -101,6 +101,7 @@ fn serve(cmd: &str, opts: &Serve) -> i32 {
                 opts.entry.as_deref().unwrap_or("")
             )),
             port: Some(port),
+            created_at: serve_core::time::iso(serve_core::time::now_ms()),
             ..Record::default()
         };
         return out::done(cmd, &record, opts);

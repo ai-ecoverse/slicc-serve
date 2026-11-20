@@ -487,6 +487,55 @@ describe('serve in a kernel with a page', { skip }, () => {
   });
 });
 
+describe('what 1.0.0 got wrong in seven', { skip }, () => {
+  beforeEach(stopAll);
+
+  it('lists nothing when nothing is published (#18)', async () => {
+    assert.deepEqual(await run(['serve', '--list']), {
+      status: 0,
+      stdout: 'no previews\n',
+      stderr: '',
+    });
+    assert.deepEqual(await run(['serve', '--list', '--json']), {
+      status: 0,
+      stdout: '[]\n',
+      stderr: '',
+    });
+  });
+
+  it('prints JSON for --local DIR and --local --port with --json (#19)', async () => {
+    const dir = await run(['serve', '--local', '--json', '/w/site']);
+    assert.equal(dir.status, 0, dir.stderr);
+    assert.equal(dir.stderr, '');
+    const out = JSON.parse(dir.stdout);
+    assert.equal(out.mode, 'local');
+    assert.equal(out.root, '/w/site');
+    assert.match(out.localUrl, /^http:\/\/\d+\.kernel\.localhost\/$/);
+    assert.equal(out.port, Number(new URL(out.localUrl).hostname.split('.')[0]));
+    const port = await run(['serve', '--port', String(out.port), '--local', '--json']);
+    assert.equal(port.status, 0, port.stderr);
+    const shown = JSON.parse(port.stdout);
+    assert.match(shown.createdAt, /^\d{4}-\d\d-\d\dT/);
+    assert.deepEqual(
+      { ...shown, createdAt: 'x' },
+      { mode: 'local', localUrl: out.localUrl, port: out.port, createdAt: 'x', foreground: false }
+    );
+  });
+
+  it('returns from --local DIR and keeps serving in the background (#20)', async () => {
+    const res = await run(['serve', '--local', '/w/site']);
+    assert.equal(res.status, 0, res.stderr);
+    assert.doesNotMatch(res.stderr, /in the foreground/);
+    const port = Number(new URL(res.stdout.trim()).hostname.split('.')[0]);
+    assert.equal(await (await os.fetch(port, '/')).text(), '<h1>hi</h1>');
+    const [record] = await records();
+    assert.equal(record.mode, 'local');
+    assert.equal((await run(['serve', '--stop', res.stdout.trim()])).status, 0);
+    await gone(record.pid);
+    await refused(port);
+  });
+});
+
 describe('serve without a page', { skip }, () => {
   it('gets ENOTSUP from a session no page answers, and still serves --local', async () => {
     const bare = await boot();

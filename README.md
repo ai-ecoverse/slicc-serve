@@ -26,6 +26,12 @@ npm install -g @ai-ecoverse/slicc-serve
 
 In SLICC, `pnpm add -g @ai-ecoverse/slicc-serve` puts `serve` and `scserve` in `/usr/bin` (the package declares both in `slicc.commands` with `abi: wasi`).
 
+seven's pnpm enforces `minimumReleaseAge=1440`, so it installs a release only once it is 24 hours old. To install a newer one before that:
+
+```sh
+pnpm add -g @ai-ecoverse/slicc-serve --config.minimumReleaseAgeExclude='@ai-ecoverse/slicc-serve*'
+```
+
 Binaries: macOS (arm64, x86-64, signed and notarized), Linux (arm64, x86-64, static musl) and Windows (arm64, x86-64). [The installers](#the-installers) has the details.
 
 ## Usage
