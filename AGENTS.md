@@ -1,6 +1,6 @@
 # slicc-serve
 
-`scserve` on hosts, `serve`/`scserve` in SLICC: publish a directory or a local server through the SLICC tray hub. README.md is the spec. Rust workspace: `crates/serve` (bin), `serve-core` (no host-only deps, builds for `wasm32-wasip1`), `serve-hub` (native: tray, relay daemon, hub client). npm `@ai-ecoverse/slicc-serve` and `…-<os>-<arch>`.
+`scserve` on hosts, `serve`/`scserve` in SLICC: publish a directory or a local server through the SLICC tray hub. README.md is the spec. Rust workspace: `crates/serve` (bin), `serve-core` (no host-only deps, builds for `wasm32-wasip1-threads`), `serve-hub` (native: tray, relay daemon, hub client). npm `@ai-ecoverse/slicc-serve` and `…-<os>-<arch>`.
 
 No comments in files we write. Guidance only here (≤1000 chars); no CLAUDE.md. Unit tests: gitignored `test/unit/<crate>.rs` under `cfg(all(test, serve_unit))`, 100% diff coverage. Regressions: committed `test/integration/` against `fake-hub.mjs`, via the CLI; every bug fix adds one.
 
