@@ -333,6 +333,31 @@ describe('serve in a kernel with a page', { skip }, () => {
     await eventually(() => held.ended?.startsWith('revoked'), 20_000);
   });
 
+  it('keeps a preview published after the terminal that started it hangs up', async () => {
+    let output = '';
+    const term = await os.kernel.openTerminal(['bash', '-i'], {
+      cwd: '/w',
+      onData: (bytes) => {
+        output += Buffer.from(bytes).toString();
+      },
+    });
+    term.write('(serve site; echo "done $?"; sleep 60)\r');
+    await eventually(() => output.includes('done 0'), 20_000);
+    const [record] = await records();
+    const [preview] = page.previews.values();
+    assert.equal(record.previewToken, preview.token);
+    term.close();
+    await term.exited;
+    await new Promise((r) => setTimeout(r, 3000));
+    assert.equal(preview.ended, undefined);
+    assert.equal((await os.sh(`test -e /proc/${record.pid}`)).status, 0);
+    assert.equal(await (await os.fetch(record.port, '/')).text(), '<h1>hi</h1>');
+    assert.deepEqual(
+      (await records()).map((r) => r.id),
+      [record.id]
+    );
+  });
+
   it('opens the URL with open.url for --open', async () => {
     const res = await run(['serve', '--open', '/w/site']);
     assert.equal(res.status, 0, res.stderr);

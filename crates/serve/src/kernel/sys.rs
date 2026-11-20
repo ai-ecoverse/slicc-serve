@@ -34,13 +34,20 @@ mod ffi {
         pub fn fd_close(fd: u32) -> u16;
     }
 
+    #[link(wasm_import_module = "slicc")]
+    extern "C" {
+        pub fn sigaction_set(sig: u32, disposition: u32, flags: u32) -> u16;
+    }
+
     #[link(wasm_import_module = "slicc_fs")]
     extern "C" {
         pub fn path_chmod(dirfd: i32, path: *const u8, len: u32, mode: u32, flags: u32) -> u16;
     }
 }
 
+pub const SIGHUP: u32 = 1;
 pub const SIGTERM: u32 = 15;
+const SIG_IGN: u32 = 1;
 const AT_FDCWD: i32 = -2;
 const OP_SIZE: usize = 56;
 const OFLAG_CREAT: u16 = 1;
@@ -84,6 +91,10 @@ pub fn pid() -> u32 {
 
 pub fn signal(pid: u32, sig: u32) -> io::Result<()> {
     cvt(unsafe { ffi::proc_signal(pid, sig) })
+}
+
+pub fn ignore(sig: u32) -> io::Result<()> {
+    cvt(unsafe { ffi::sigaction_set(sig, SIG_IGN, 0) })
 }
 
 pub fn chmod(path: &std::path::Path, mode: u32) {

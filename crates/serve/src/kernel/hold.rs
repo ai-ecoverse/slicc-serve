@@ -193,6 +193,9 @@ fn report(value: &Value) {
 }
 
 pub fn background(cmd: &str, raw: &str) -> i32 {
+    if let Err(e) = sys::ignore(sys::SIGHUP) {
+        eprintln!("{cmd}: can't ignore SIGHUP, so a closing terminal may stop this preview: {e}");
+    }
     let Ok(spec) = serde_json::from_str::<Spec>(raw) else {
         report(&Failure::plain(format!("{cmd}: a bad request for the background {cmd}")).to_json());
         return 2;
