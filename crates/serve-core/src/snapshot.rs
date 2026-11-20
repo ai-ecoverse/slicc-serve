@@ -1,5 +1,6 @@
-use crate::{mime, safe, MAX_FILE_BYTES, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_FILES};
-use std::collections::HashSet;
+use crate::{
+    mime, safe, MAX_FILE_BYTES, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_DIRS, MAX_SNAPSHOT_FILES,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14,7 +15,8 @@ pub fn collect(root: &Path) -> Result<Vec<File>, String> {
     let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
     let mut walk = Walk {
         root: root.clone(),
-        visited: HashSet::from([root.clone()]),
+        stack: vec![root.clone()],
+        dirs: 0,
         files: Vec::new(),
         total: 0,
     };
@@ -24,7 +26,8 @@ pub fn collect(root: &Path) -> Result<Vec<File>, String> {
 
 struct Walk {
     root: PathBuf,
-    visited: HashSet<PathBuf>,
+    stack: Vec<PathBuf>,
+    dirs: usize,
     files: Vec<File>,
     total: u64,
 }
@@ -44,8 +47,17 @@ impl Walk {
             prefix.push(name.clone());
             let rel = prefix.join("/");
             if meta.is_dir() {
-                if self.visited.insert(real.clone()) {
-                    self.dir(&real, prefix)?;
+                if !self.stack.contains(&real) {
+                    self.dirs += 1;
+                    if self.dirs > MAX_SNAPSHOT_DIRS {
+                        return Err(format!(
+                            "the snapshot walks more than {MAX_SNAPSHOT_DIRS} directories (count each symlinked directory once per path to it)"
+                        ));
+                    }
+                    self.stack.push(real.clone());
+                    let walked = self.dir(&real, prefix);
+                    self.stack.pop();
+                    walked?;
                 }
             } else if meta.is_file() {
                 if name.contains(['\\', ':']) {
