@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { fakeHub } from './fake-hub.mjs';
@@ -252,6 +252,39 @@ test('--ttl counts an aliased subtree once per path, so the file limit bounds it
   const res = await box.run(['--ttl', '1h', site]);
   assert.equal(res.code, 1);
   assert.match(res.stderr, /the snapshot exceeds 1000 files/);
+});
+
+test('--ttl walks at most 10,000 directories, aliases counted per path, before it mints', async () => {
+  const box = sandbox(hub);
+  const site = box.site({ 'index.html': 'x' });
+  for (let i = 0; i < 10_000; i++) mkdirSync(join(site, 'd', String(i)), { recursive: true });
+  rmSync(join(site, 'd', '0'), { recursive: true });
+  const before = hub.hits('POST', /\/preview$/);
+  const fits = await box.run(['--ttl', '1h', site]);
+  assert.equal(fits.code, 0, fits.stderr);
+  assert.equal(hub.hits('POST', /\/preview$/), before + 1);
+  mkdirSync(join(site, 'd', '0'));
+  mkdirSync(join(site, 'd', 'extra'));
+  const over = await box.run(['--ttl', '1h', site]);
+  assert.equal(over.code, 1);
+  assert.match(over.stderr, /^scserve: the snapshot walks more than 10000 directories/);
+  assert.equal(hub.hits('POST', /\/preview$/), before + 1);
+});
+
+test('--ttl refuses a web of directory symlinks without files instead of walking it forever', {
+  skip: process.platform === 'win32' && 'symlinks need privileges on Windows',
+}, async () => {
+  const box = sandbox(hub);
+  const site = box.site({ 'index.html': 'x' });
+  for (let n = 0; n < 8; n++) mkdirSync(join(site, `d${n}`));
+  for (let n = 0; n < 8; n++) {
+    for (let m = 0; m < 8; m++) if (n !== m) symlinkSync(`../d${m}`, join(site, `d${n}`, `to${m}`));
+  }
+  const before = hub.hits('POST', /\/preview$/);
+  const res = await box.run(['--ttl', '1h', site]);
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /^scserve: the snapshot walks more than 10000 directories/);
+  assert.equal(hub.hits('POST', /\/preview$/), before);
 });
 
 test('--ttl leaves out symlinks to hidden files and survives directories that link to each other', {
