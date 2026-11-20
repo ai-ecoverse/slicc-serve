@@ -287,8 +287,8 @@ npm test
 npm run build:wasm
 ```
 
-- `crates/serve` is the binary (`scserve`, and `scserve.wasm` for the kernel); `crates/serve-core` has no host-only dependency and builds for `wasm32-wasip1`; `crates/serve-hub` (native only) is the hub client, the tray, the relay and the CLI.
-- `npm run lint`: Biome, the no-comment check, `slicc-lint`, `shellcheck` and `dash -n` on `install.sh`, `cargo fmt`, and `cargo clippy` for the host and `wasm32-wasip1`.
+- `crates/serve` is the binary (`scserve`, and `scserve.wasm` for the kernel); `crates/serve-core` has no host-only dependency and builds for `wasm32-wasip1-threads`; `crates/serve-hub` (native only) is the hub client, the tray, the relay and the CLI.
+- `npm run lint`: Biome, the no-comment check, `slicc-lint`, `shellcheck` and `dash -n` on `install.sh`, `cargo fmt`, and `cargo clippy` for the host and `wasm32-wasip1-threads`.
 - `npm test` builds `scserve` and runs `test/integration/` with Node's test runner. The hub there is `fake-hub.mjs`: trays, leader election, the controller WebSocket (`preview.request` to the relay and the chunks back, `preview.revoked`), mint, upload, finalize, stop and list, a visitor path that resolves `<label>.localhost` hosts like the preview worker, and injected answers per route for every class of error. Tests never reach `www.sliccy.ai`. `wasm.test.mjs` runs `bin/serve.wasm` under `node:wasi` (after `npm run build:wasm`), `install.test.mjs` runs `install.sh` and `--upgrade` against local release directories.
 - `npm run test:unit` runs the unit tests in the gitignored `test/unit/` with `cargo llvm-cov`; the pre-commit hook wants 100% coverage of the changed lines in the crates it measures.
 
