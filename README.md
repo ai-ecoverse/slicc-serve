@@ -242,22 +242,22 @@ This is what seven's page answers ([#6](https://github.com/ai-ecoverse/slicc-ser
 | --- | --- |
 | `port` | number, 1 to 65535: the origin on the kernel's loopback, which the page reaches with `kernel.loopbackFetch(…, {port})` |
 | `root` | string: the directory's absolute path in the kernel, for the prompt and the chip only; absent with `--port`. The page never reads files: every visit goes to `port` |
-| `entry` | string, absent without `--entry`: the `--entry` path as `serve` normalized it (segments joined by `/`; no empty, `.` or `..` segment; no leading `/`; no `\`, `:` or NUL). The page refuses anything else with `NotAllowedError` `invalid entry` |
-| `allowLive` | boolean: `true` for `--port` (the hub doesn't edge-cache it), `false` for a directory (the hub's 5 s edge cache) |
+| `entry` | string, absent without `--entry`: the `--entry` path as `serve` normalized it (segments joined by `/`; no empty, `.` or `..` segment; no leading `/`; no `\`, `:` or NUL). The page refuses anything else, and a `port` outside 1 to 65535, with an `EIO` error (`invalid entry`, `invalid port`) |
+| `allowLive` | boolean: `true` for `--port` (the hub doesn't edge-cache it), `false` for a directory (the hub's 5 s edge cache); `serve` always sends it, and the page takes `true` when it is missing |
 
 What the page does, in order:
 
-1. **Who may publish:** a follower, or a page that leads no tray right now, throws `NotSupportedError` (`ENOTSUP`), for example `seven isn't connected to the tray hub`. The switch "Public previews" off throws `NotAllowedError` (`EACCES`) `public previews are switched off in seven's settings`.
+1. **Who may publish:** a follower, a page that runs no kernel, or a seven with no tray hub configured throws `NotSupportedError` (`ENOTSUP`). A tray that isn't connected right now throws an `EIO` error with what is wrong. The switch "Public previews" off throws `NotAllowedError` (`EACCES`), `public previews are off in seven's settings`. The messages are bios's to choose; `serve` prints the first line as it is.
 2. **The prompt:** unless the stamp says `serve` was typed in seven's terminal with a gesture still active (bios's `typed(stamp)`), the page asks: "Publish /home/me/site at a public URL?" (or "the server on port 5173"). Cancel, 60 s without an answer, or a second request of the same session while one is up, throws `NotAllowedError` with what happened (`the request to publish was dismissed`, `nobody answered the request to publish within 60 s`, `another request is waiting for you`); `serve` prints the message as it is.
-3. **The mint:** `POST /api/tray/<trayId>/preview` `{servedRoot, entryPath, allowLive}`, where `servedRoot` is `/srv/serve/<id>` with a fresh 16-hex-digit `<id>` from `crypto.getRandomValues` for each request (never the real path, never the port: ports are reused), and `entryPath` is `<servedRoot>/<entry>`, or `<servedRoot>/index.html` without `entry` (the hub rejects `<servedRoot>/`).
-4. **A hub failure** is the reply, not an errno: one line `{"error": <the hub's error, or the status text>, "status": <its HTTP status>, "code": <its code, when it has one>, "retryAfter": <its Retry-After, when present>, "signIn": <a sign-in URL, when the hub named one>}`, then end-of-file. A hub the page can't reach at all is an error (`EIO`) with the reason.
-5. **Registered:** the page keeps `servedRoot → {port, entryPath, entryIsRoot: entry absent, previewToken, url, root, entry, createdAt, uid: stamp.uid}` and answers `{"url": <the hub's url, unchanged>, "previewToken": …, "trayId": …, "createdAt": <ISO 8601>}` and a newline. `serve` prints the URL with a trailing `index.html` dropped when there is no `entry`.
+3. **The mint:** `POST /api/tray/<trayId>/preview` `{servedRoot, entryPath, allowLive}`, where `servedRoot` is `/srv/serve/<id>` with a fresh random hex `<id>` of at least 16 digits from `crypto.getRandomValues` for each request (bios uses 32; the host relay 16) (never the real path, never the port: ports are reused), and `entryPath` is `<servedRoot>/<entry>`, or `<servedRoot>/index.html` without `entry` (the hub rejects `<servedRoot>/`).
+4. **A failure the hub answered** (the mint's HTTP status wasn't 2xx) is the reply, not an errno, so that `serve` can exit 3 or 4: one line `{"error": <the hub's error, or the status text>, "status": <its HTTP status>, "code": <its code, when it has one>, "retryAfter": <its Retry-After, when present>, "signIn": <a sign-in URL, when the hub named one>}`, then end-of-file. A hub the page can't reach at all is an error (`EIO`) with the reason.
+5. **Registered:** the page keeps `servedRoot → {port, entryPath, entryIsRoot: entry absent, previewToken, url, root, entry, since, uid: stamp.uid}` and answers `{"url": …, "previewToken": …}` and a newline, optionally with `"trayId"`. The `url` is the hub's, with a trailing `index.html` dropped when there is no `entry` (the page may leave that to `serve`, which drops it too).
 6. **Held open:** the page's reply stream stays open, with nothing more in it, as long as the preview is live. The page shows the live chip ("Serving publicly … Stop").
 
 How it ends:
 
 - **From the command's side:** the kernel aborts the handler's `signal` (reason `closed` when the description is closed or its process ends, `interrupted` when a signal reaches the blocked read) and cancels the reply stream. On either, the page revokes the preview on the hub (`POST /api/tray/<trayId>/preview/stop {previewToken}`) and drops it from the registry. If the signal is already aborted when the mint answers (the process went away during the prompt or the mint), the page revokes at once and replies nothing.
-- **From the page's side** (the chip's Stop, `serve.stop`, `preview.revoked` from the hub, the switch turned off, the tray lost): the page revokes it on the hub unless the hub revoked it, drops it, writes `{"stopped": <reason>}` and a newline (`stopped in seven`, `stopped with serve --stop`, `revoked by the tray hub`, `public previews were switched off`, `seven lost its tray`), and closes the stream. `serve` treats end-of-file with or without that line the same way.
+- **From the page's side** (the chip's Stop, `serve.stop`, `preview.revoked` from the hub, the switch turned off, the tray lost): the page revokes it on the hub unless the hub revoked it, drops it, writes `{"stopped": <reason>}` and a newline (`stopped in seven`, `stopped with serve --stop`, `revoked by the tray hub`, `public previews were switched off`, `seven lost its tray`), and closes the stream. Every page-side end writes the line, the chip's Stop and `serve.stop` included; `serve` treats end-of-file without it as `stopped in seven`.
 - **A reload** ends the kernel, and every process with it: on boot, and after each leader reconnect, the page revokes the tray's live previews it holds no registration for, as the host relay does.
 
 The relay itself (`preview.request` → `kernel.loopbackFetch(GET <path>, {port, headers: {range}})` → `preview.response` chunks) follows [The relay's answers](#the-relays-answers), with `vfsPath` checked against the registered `servedRoot`, the path under it sent as it came, and the `entryPath` of a preview without `entry` sent as `/`.
@@ -268,7 +268,7 @@ The relay itself (`preview.request` → `kernel.loopbackFetch(GET <path>, {port,
 {"kind":"serve.list"}
 ```
 
-The reply is one JSON object per line for each preview the page holds from `serve.publish` that the caller may see: those whose publishing process had the caller's uid, all of them for root. `{"previewToken", "url", "root", "port", "entry", "createdAt"}`, with `root` and `entry` absent as in the request. An empty reply means none.
+The reply is one JSON object per line for each preview the page holds from `serve.publish` that the caller may see: those whose publishing process had the caller's uid, all of them for root. `{"previewToken", "url", "root", "port", "entry", "since"}`, with `root` and `entry` absent as in the request and `since` the mint's time in milliseconds since the epoch. An empty reply means none.
 
 #### `serve.stop`
 
@@ -276,7 +276,7 @@ The reply is one JSON object per line for each preview the page holds from `serv
 {"kind":"serve.stop","previewToken":"0f3c….a91e…"}
 ```
 
-The page revokes the preview on the hub, drops it, and ends its `serve.publish` reply with `{"stopped":"stopped with serve --stop"}`, so the background `serve` that holds it exits. A preview the page doesn't hold from `serve.publish`, or one of another uid for a caller that isn't root, throws `NotFoundError` (`ENOENT`) `seven holds no preview <token>`.
+The page revokes the preview on the hub, drops it, and ends its `serve.publish` reply with `{"stopped":"stopped with serve --stop"}`, so the background `serve` that holds it exits. A token the page doesn't hold is revoked on the tray all the same; one the hub has no preview for throws `NotFoundError` (`ENOENT`), `the tray hub has no such preview`. A held preview of another uid, for a caller that isn't root, is `ENOENT` too.
 
 ## Development
 
