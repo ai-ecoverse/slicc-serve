@@ -3,11 +3,9 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync }
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { assetName, NAME, TARGETS } from './targets.mjs';
+import { assetName, mainManifest, NAME, TARGETS } from './targets.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const description =
-  'serve and scserve: publish a directory or a local server at a public capability URL through the SLICC tray hub, on any host and inside SLICC';
 const common = {
   license: 'Apache-2.0',
   repository: { type: 'git', url: 'git+https://github.com/ai-ecoverse/slicc-serve.git' },
@@ -79,23 +77,7 @@ function stageMain(platforms) {
   copyFileSync(need(join(values.from, 'serve.wasm')), join(dir, 'bin', 'serve.wasm'));
   copyFileSync(join(root, 'LICENSE'), join(dir, 'LICENSE'));
   copyFileSync(join(root, 'README.md'), join(dir, 'README.md'));
-  write(dir, 'package.json', {
-    name: NAME,
-    version,
-    description,
-    ...common,
-    bin: { scserve: 'bin/scserve.js' },
-    files: ['bin/scserve.js', 'bin/serve.wasm'],
-    engines: { node: '>=18' },
-    slicc: {
-      abi: 'wasi',
-      commands: {
-        serve: { wasm: 'bin/serve.wasm' },
-        scserve: { wasm: 'bin/serve.wasm' },
-      },
-    },
-    optionalDependencies: Object.fromEntries(platforms.map((name) => [name, version])),
-  });
+  write(dir, 'package.json', mainManifest(version, platforms));
 }
 
 rmSync(values.out, { recursive: true, force: true });

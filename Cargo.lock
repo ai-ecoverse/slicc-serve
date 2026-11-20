@@ -493,6 +493,8 @@ dependencies = [
 name = "serve"
 version = "0.0.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "serve-core",
  "serve-hub",
  "wasix-net",
@@ -503,6 +505,7 @@ name = "serve-core"
 version = "0.0.0"
 dependencies = [
  "serde",
+ "serde_json",
  "wasix-net",
 ]
 

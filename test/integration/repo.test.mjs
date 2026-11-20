@@ -35,6 +35,7 @@ test('npm-stage builds the main package with slicc.commands and the platform pac
   assert.equal(main.name, '@ai-ecoverse/slicc-serve');
   assert.equal(main.version, '1.2.3');
   assert.deepEqual(main.bin, { scserve: 'bin/scserve.js' });
+  assert.deepEqual(main.engines, { node: '>=18', 'slicc-kernel': '>=1.153.0' });
   assert.deepEqual(main.slicc, {
     abi: 'wasi',
     commands: { serve: { wasm: 'bin/serve.wasm' }, scserve: { wasm: 'bin/serve.wasm' } },

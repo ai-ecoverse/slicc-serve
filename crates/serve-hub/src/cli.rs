@@ -102,7 +102,7 @@ fn list_cmd(hub: &Hub, dirs: &Dirs, json: bool, out: Out, err: Out) -> i32 {
             if json {
                 let _ = writeln!(out, "{}", Value::Array(rows));
             } else {
-                let _ = write!(out, "{}", list::table(&rows));
+                let _ = write!(out, "{}", serve_core::table::render(&rows));
             }
             0
         }

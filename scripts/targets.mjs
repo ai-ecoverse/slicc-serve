@@ -52,6 +52,31 @@ export const TARGETS = [
 export const SCOPE = '@ai-ecoverse';
 export const NAME = `${SCOPE}/slicc-serve`;
 
+export const KERNEL = '>=1.153.0';
+
+export function mainManifest(version, platforms) {
+  return {
+    name: NAME,
+    version,
+    description:
+      'serve and scserve: publish a directory or a local server at a public capability URL through the SLICC tray hub, on any host and inside SLICC',
+    license: 'Apache-2.0',
+    repository: { type: 'git', url: 'git+https://github.com/ai-ecoverse/slicc-serve.git' },
+    homepage: 'https://github.com/ai-ecoverse/slicc-serve#readme',
+    bin: { scserve: 'bin/scserve.js' },
+    files: ['bin/scserve.js', 'bin/serve.wasm'],
+    engines: { node: '>=18', 'slicc-kernel': KERNEL },
+    slicc: {
+      abi: 'wasi',
+      commands: {
+        serve: { wasm: 'bin/serve.wasm' },
+        scserve: { wasm: 'bin/serve.wasm' },
+      },
+    },
+    optionalDependencies: Object.fromEntries(platforms.map((name) => [name, version])),
+  };
+}
+
 export function assetName(target) {
   return `scserve-${target.asset}${target.os === 'win32' ? '.exe' : ''}`;
 }

@@ -1,5 +1,5 @@
 use crate::fsx;
-use serve_core::record::Record;
+use serve_core::record::{self, Found, Record};
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -39,8 +39,8 @@ impl Records {
         records
     }
 
-    pub fn find(&self, target: &str) -> Option<Record> {
-        self.all().into_iter().find(|r| r.matches(target))
+    pub fn find(&self, target: &str) -> Found {
+        record::find(self.all(), target)
     }
 
     pub fn holds_snapshots(&self, tray_id: &str) -> bool {

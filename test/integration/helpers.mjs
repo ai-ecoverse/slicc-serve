@@ -9,7 +9,6 @@ import { fileURLToPath } from 'node:url';
 export const root = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const exe = process.platform === 'win32' ? 'scserve.exe' : 'scserve';
 export const binary = process.env.SCSERVE_BIN || join(root, 'target', 'debug', exe);
-export const wasm = join(root, 'bin', 'serve.wasm');
 export const expectedVersion = process.env.SCSERVE_VERSION || '0.0.0';
 
 export function sandbox(hub) {
