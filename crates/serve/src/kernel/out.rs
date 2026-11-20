@@ -31,10 +31,12 @@ impl Failure {
         let text = |k: &str| answer.get(k).and_then(Value::as_str).map(str::to_string);
         let status = answer.get("status").and_then(Value::as_u64).unwrap_or(0);
         let mut error = text("error").unwrap_or_else(|| "the tray hub failed".into());
-        if text("code").as_deref() == Some("LIVE_PREVIEW_LIMIT") {
-            error.push_str(&format!(
+        match text("code").as_deref() {
+            Some("LIVE_PREVIEW_LIMIT") => error.push_str(&format!(
                 "; list them with `{cmd} --list` and stop the ones you no longer need with `{cmd} --stop <token>`"
-            ));
+            )),
+            Some(code) => error.push_str(&format!(" ({code})")),
+            None => {}
         }
         let sign_in = text("signIn");
         let (exit, mut lines) = match status {

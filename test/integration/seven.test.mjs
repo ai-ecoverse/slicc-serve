@@ -401,9 +401,14 @@ describe('serve in a kernel with a page', { skip }, () => {
         "serve: publishing: the tray hub's limit is reached (429: too many; list them with `serve --list` and stop the ones you no longer need with `serve --stop <token>`)\nserve: retry after 30 s\n",
       ],
       [
-        { error: 'sign in first', status: 403, signIn: 'https://auth.example/login' },
+        {
+          error: 'sign in first',
+          status: 403,
+          code: 'TRAY_REVOKED',
+          signIn: 'https://auth.example/login',
+        },
         3,
-        'serve: publishing: the tray hub refused it (403: sign in first)\nserve: sign in at https://auth.example/login\n',
+        'serve: publishing: the tray hub refused it (403: sign in first (TRAY_REVOKED))\nserve: sign in at https://auth.example/login\n',
       ],
       [
         { error: 'gated', status: 302, signIn: 'https://auth.example/' },
