@@ -69,15 +69,7 @@ fn open(write_only: bool) -> Result<File, Error> {
 }
 
 fn attempt<T>(f: impl FnOnce() -> io::Result<T>) -> Result<T, Error> {
-    let (result, captured) = sys::quietly(f);
-    let marker = format!("{DEVICE}: ");
-    let mut message = None;
-    for line in captured.lines() {
-        match line.find(&marker) {
-            Some(i) if message.is_none() => message = Some(line[i + marker.len()..].to_string()),
-            _ => eprintln!("{line}"),
-        }
-    }
+    let (result, message) = sys::quietly(&format!("{DEVICE}: "), f);
     result.map_err(|e| refused(e, message))
 }
 
@@ -96,6 +88,42 @@ pub fn publish(request: &Value) -> Result<(BufReader<File>, String), Error> {
         reader.read_line(&mut line)?;
         Ok((reader, line))
     })
+}
+
+pub fn snapshot(request: &Value, files: &[serve_core::snapshot::File]) -> Result<String, Error> {
+    let mut file = open(false)?;
+    attempt(move || {
+        let sent = send_body(&mut file, request, files);
+        let mut reply = String::new();
+        let read = file.read_to_string(&mut reply);
+        match (sent, read) {
+            (_, Ok(_)) if !reply.trim().is_empty() => Ok(reply),
+            (Err(e), _) => Err(e),
+            (Ok(()), Err(e)) => Err(e),
+            (Ok(()), Ok(_)) => Ok(reply),
+        }
+    })
+}
+
+fn send_body(
+    file: &mut File,
+    request: &Value,
+    files: &[serve_core::snapshot::File],
+) -> io::Result<()> {
+    file.write_all(&header(request))?;
+    for f in files {
+        let mut source = File::open(&f.abs)?;
+        let line = serde_json::json!({ "path": f.path, "type": f.mime, "size": f.size });
+        file.write_all(&header(&line))?;
+        let sent = io::copy(&mut (&mut source).take(f.size), file)?;
+        if sent != f.size {
+            return Err(io::Error::other(format!(
+                "{} changed while it was sent",
+                f.path
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn exchange(request: &Value) -> Result<String, Error> {

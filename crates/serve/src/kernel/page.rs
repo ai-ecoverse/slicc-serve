@@ -13,29 +13,40 @@ fn row(preview: &Value, record: Option<&Record>) -> Value {
         .and_then(Value::as_u64)
         .map(time::iso)
         .or_else(|| text("createdAt"));
+    let snapshot = text("mode").as_deref() == Some("persistent");
+    let expires = preview
+        .get("expiresAt")
+        .and_then(Value::as_u64)
+        .map(time::iso)
+        .or_else(|| record.and_then(|r| r.expires_at.clone()));
     json!({
         "previewToken": text("previewToken"),
-        "mode": "live",
+        "mode": if snapshot { "snapshot" } else { "live" },
         "url": record.and_then(|r| r.url.clone()).or_else(|| text("url")),
         "localUrl": record.and_then(|r| r.local_url.clone()),
         "root": record.and_then(|r| r.root.clone()).or_else(|| text("root")),
         "createdAt": record.map(|r| r.created_at.clone()).or(since),
-        "expiresAt": Value::Null,
+        "expiresAt": if snapshot { json!(expires) } else { Value::Null },
         "foreground": record.is_some_and(|r| r.foreground),
     })
 }
 
 fn local_row(record: &Record) -> Value {
     let live = record.preview_token.is_some();
+    let mode = match (record.mode.as_str(), live) {
+        ("persistent", _) => "snapshot",
+        (_, true) => "live",
+        _ => "local",
+    };
     json!({
         "previewToken": record.preview_token,
         "id": record.id,
-        "mode": if live { "live" } else { "local" },
+        "mode": mode,
         "url": if live { record.url.clone() } else { record.local_url.clone() },
         "localUrl": record.local_url,
         "root": record.root,
         "createdAt": record.created_at,
-        "expiresAt": Value::Null,
+        "expiresAt": record.expires_at,
         "foreground": record.foreground,
     })
 }

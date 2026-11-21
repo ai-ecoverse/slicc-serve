@@ -453,11 +453,6 @@ describe('serve in a kernel with a page', { skip }, () => {
     assert.equal(res.status, 0, res.stderr);
     assert.equal(page.calls[0].options.root, `/w/${name}`);
     assert.equal((await os.sh('test -e /w/pwned || test -e pwned')).status, 1);
-    assert.deepEqual(await run(['serve', '--ttl', '1d', '/w/site']), {
-      status: 1,
-      stdout: '',
-      stderr: "serve: --ttl from SLICC needs seven's serve.snapshot, which isn't there yet\n",
-    });
     assert.equal((await run(['serve', '/w/nope'])).stderr, 'serve: no such directory: /w/nope\n');
     assert.equal(
       (await run(['serve', '--entry', 'x.html', '/w/site'])).stderr,

@@ -1,6 +1,6 @@
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::fd::FromRawFd;
 
 mod ffi {
@@ -172,25 +172,47 @@ pub fn spawn(argv: &[String], ops: &[Op]) -> io::Result<u32> {
     Ok(pid)
 }
 
-pub fn quietly<T>(f: impl FnOnce() -> T) -> (T, String) {
+pub fn quietly<T>(marker: &str, f: impl FnOnce() -> T) -> (T, Option<String>) {
     let Ok(saved) = dup(2) else {
-        return (f(), String::new());
+        return (f(), None);
+    };
+    let Ok(echo) = dup(saved) else {
+        let _ = close(saved);
+        return (f(), None);
     };
     let Ok((r, w)) = pipe() else {
         let _ = close(saved);
-        return (f(), String::new());
+        let _ = close(echo);
+        return (f(), None);
     };
     if renumber(w, 2).is_err() {
         let _ = close(w);
         let _ = close(r);
         let _ = close(saved);
-        return (f(), String::new());
+        let _ = close(echo);
+        return (f(), None);
     }
-    let out = f();
+    let marker = marker.to_string();
+    let forward = std::thread::spawn(move || {
+        let mut out = file(echo);
+        let mut message = None;
+        for line in BufReader::new(file(r)).lines() {
+            let Ok(line) = line else { break };
+            match line.find(&marker) {
+                Some(i) => {
+                    message.get_or_insert_with(|| line[i + marker.len()..].to_string());
+                }
+                None => {
+                    let _ = writeln!(out, "{line}");
+                }
+            }
+        }
+        message
+    });
+    let result = f();
     let _ = renumber(saved, 2);
-    let mut text = String::new();
-    let _ = file(r).read_to_string(&mut text);
-    (out, text)
+    let message = forward.join().ok().flatten();
+    (result, message)
 }
 
 pub fn alive(pid: u32) -> bool {
