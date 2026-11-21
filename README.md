@@ -9,10 +9,20 @@ This README is the spec. The plan is [#1](https://github.com/ai-ecoverse/slicc-s
 ## Install
 
 ```sh
-curl -fsSL https://github.com/ai-ecoverse/slicc-serve/releases/latest/download/install.sh | sh
+curl -fsSL https://get.sliccy.ai/serve | sh
 ```
 
 On Windows, in PowerShell:
+
+```powershell
+irm https://get.sliccy.ai/serve.ps1 | iex
+```
+
+`get.sliccy.ai/serve` redirects to the latest release's `install.sh`, and `serve.ps1` runs its `install.ps1` ([sliccy-ai](https://github.com/ai-ecoverse/sliccy-ai)). The release assets work directly too, and options go after `sh -s --` (for example `curl -fsSL https://get.sliccy.ai/serve | sh -s -- --dir ~/bin`):
+
+```sh
+curl -fsSL https://github.com/ai-ecoverse/slicc-serve/releases/latest/download/install.sh | sh
+```
 
 ```powershell
 irm https://github.com/ai-ecoverse/slicc-serve/releases/latest/download/install.ps1 | iex
