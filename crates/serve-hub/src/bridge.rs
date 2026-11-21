@@ -1,3 +1,4 @@
+use crate::remote;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,9 +51,19 @@ struct Pending {
     conn: String,
     method: String,
     url: Option<String>,
-    by_value: bool,
-    source: Option<String>,
+    shape: Shape,
+    group: Option<String>,
     at: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Raw,
+    Remote,
+    Properties,
+    Describe,
+    Resolve,
+    Ignored,
 }
 
 #[derive(Default)]
@@ -64,8 +75,8 @@ struct State {
     pending: HashMap<u64, Pending>,
     records: VecDeque<Value>,
     contexts: u64,
-    objects: HashMap<String, (String, String)>,
-    handles: u64,
+    groups: HashMap<(String, String), Vec<String>>,
+    bridged: std::collections::HashSet<String>,
 }
 
 #[derive(Default)]
@@ -118,115 +129,89 @@ fn answer(id: &Value, outcome: Result<Value, (i64, String)>, session: Option<&st
     m.to_string()
 }
 
-fn by_value_expression(source: &str) -> String {
-    let literal = serde_json::to_string(source).unwrap_or_else(|_| "\"\"".into());
-    format!(
-        "Promise.resolve((0, eval)({literal})).then((v) => JSON.stringify({{ t: typeof v, v }}))"
-    )
-}
+type Translated = ((String, Value), Shape);
 
-fn unwrap_by_value(result: Value) -> Value {
-    if result.get("exceptionDetails").is_some() {
-        return result;
-    }
-    let Some(packed) = result
-        .pointer("/result/value")
-        .and_then(Value::as_str)
-        .and_then(|t| serde_json::from_str::<Value>(t).ok())
-    else {
-        return result;
-    };
-    let kind = packed
-        .get("t")
-        .and_then(Value::as_str)
-        .unwrap_or("undefined");
-    let remote = match (kind, packed.get("v")) {
-        ("undefined", _) | (_, None) => json!({ "type": "undefined" }),
-        (_, Some(Value::Null)) => json!({ "type": "object", "subtype": "null", "value": null }),
-        (t, Some(v)) => json!({ "type": t, "value": v }),
-    };
-    json!({ "result": remote })
-}
-
-const OPAQUE: &str = "scserve-opaque";
-const NO_OBJECTS: &str = "the preview bridge can't hold objects of the visitor's page";
-
-fn describing_expression(source: &str) -> String {
-    let literal = serde_json::to_string(source).unwrap_or_else(|_| "\"\"".into());
-    format!(
-        "Promise.resolve((0, eval)({literal})).then((v) => JSON.stringify({{ t: typeof v, \
-         s: v === null ? 'null' : Array.isArray(v) ? 'array' : v instanceof Error ? 'error' : \
-         typeof Node !== 'undefined' && v instanceof Node ? 'node' : undefined, \
-         c: v !== null && v !== undefined && v.constructor ? v.constructor.name : undefined, \
-         d: typeof v === 'function' || (v !== null && typeof v === 'object') ? String(v).slice(0, 1000) : undefined, \
-         v: v === null || typeof v === 'string' || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v)) ? v : undefined, \
-         u: typeof v === 'bigint' ? v + 'n' : typeof v === 'number' && !Number.isFinite(v) ? String(v) : undefined }}))"
-    )
-}
-
-fn described(result: Value) -> Value {
-    if result.get("exceptionDetails").is_some() {
-        return result;
-    }
-    let Some(d) = result
-        .pointer("/result/value")
-        .and_then(Value::as_str)
-        .and_then(|t| serde_json::from_str::<Value>(t).ok())
-    else {
-        return result;
-    };
-    let kind = d.get("t").and_then(Value::as_str).unwrap_or("undefined");
-    let mut remote = json!({ "type": kind });
-    for (from, to) in [
-        ("s", "subtype"),
-        ("c", "className"),
-        ("d", "description"),
-        ("u", "unserializableValue"),
-    ] {
-        if let Some(v) = d.get(from).filter(|v| !v.is_null()) {
-            remote[to] = v.clone();
+fn evaluate(expression: String, params: &Value) -> (String, Value) {
+    let mut sent = json!({ "expression": expression });
+    for k in ["awaitPromise", "userGesture", "timeout"] {
+        if let Some(v) = params.get(k) {
+            sent[k] = v.clone();
         }
     }
-    if let Some(v) = d.get("v") {
-        if kind != "undefined" {
-            remote["value"] = v.clone();
+    ("Runtime.evaluate".into(), sent)
+}
+
+fn translate(conn: &str, method: &str, params: &Value) -> Result<Translated, (i64, String)> {
+    let by_value = params.get("returnByValue") == Some(&json!(true));
+    let object = params.get("objectId").and_then(Value::as_str);
+    let page = |id: &str| {
+        remote::page_id(conn, id)
+            .map(str::to_string)
+            .ok_or((-32000, remote::GONE.to_string()))
+    };
+    Ok(match method {
+        "Runtime.evaluate" => (
+            evaluate(
+                remote::evaluate(&text(params, "expression"), by_value),
+                params,
+            ),
+            Shape::Remote,
+        ),
+        "Runtime.callFunctionOn" => {
+            let this = object.map(page).transpose()?;
+            let mut args = Vec::new();
+            for arg in params
+                .get("arguments")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                args.push(remote::argument(conn, arg).ok_or((-32000, remote::GONE.to_string()))?);
+            }
+            let expression = remote::call(
+                this.as_deref(),
+                &text(params, "functionDeclaration"),
+                &args,
+                by_value,
+            );
+            (evaluate(expression, params), Shape::Remote)
         }
-    }
-    if kind == "object" && d.get("s").and_then(Value::as_str) == Some("null") {
-        remote["value"] = Value::Null;
-    }
-    json!({ "result": remote })
-}
-
-fn is_object(result: &Value) -> bool {
-    matches!(
-        result.pointer("/result/type").and_then(Value::as_str),
-        Some("object" | "function")
-    ) && result.pointer("/result/subtype").and_then(Value::as_str) != Some("null")
-        && result.pointer("/result/subtype").and_then(Value::as_str) != Some("error")
-        && result.pointer("/result/objectId").is_none()
-}
-
-fn argument(
-    objects: &HashMap<String, (String, String)>,
-    conn: &str,
-    arg: &Value,
-) -> Option<String> {
-    if let Some(id) = arg.get("objectId").and_then(Value::as_str) {
-        return objects.get(id).filter(|(c, _)| c == conn).map(|(_, src)| {
-            format!(
-                "(0, eval)({})",
-                serde_json::to_string(src).unwrap_or_default()
+        "Runtime.getProperties" => {
+            let id = page(object.unwrap_or(""))?;
+            (evaluate(remote::properties(&id), params), Shape::Properties)
+        }
+        "DOM.describeNode" => {
+            let backend = params.get("backendNodeId").and_then(Value::as_u64);
+            let id = object.map(page).transpose()?;
+            if id.is_none() && backend.is_none() {
+                return Err((
+                    -32000,
+                    "the preview bridge has no DOM node ids; describe a node by its objectId"
+                        .into(),
+                ));
+            }
+            (
+                evaluate(remote::describe(id.as_deref(), backend), params),
+                Shape::Describe,
             )
-        });
-    }
-    if let Some(u) = arg.get("unserializableValue").and_then(Value::as_str) {
-        return Some(u.to_string());
-    }
-    match arg.get("value") {
-        Some(v) => Some(v.to_string()),
-        None => Some("undefined".into()),
-    }
+        }
+        "DOM.resolveNode" => {
+            let Some(backend) = params.get("backendNodeId").and_then(Value::as_u64) else {
+                return Err((
+                    -32000,
+                    "the preview bridge resolves nodes by backendNodeId only".into(),
+                ));
+            };
+            (evaluate(remote::resolve(backend), params), Shape::Resolve)
+        }
+        _ if object.is_some_and(remote::is_handle) => {
+            return Err((
+                -32000,
+                format!("the preview bridge can't pass a page object to {method}"),
+            ))
+        }
+        _ => ((method.to_string(), params.clone()), Shape::Raw),
+    })
 }
 
 fn cut(detail: &Value) -> String {
@@ -273,7 +258,7 @@ impl State {
 
     fn drop_tab(&mut self, conn: &str) -> Option<Tab> {
         let tab = self.tabs.remove(conn)?;
-        self.objects.retain(|_, (c, _)| c != conn);
+        self.groups.retain(|(c, _), _| c != conn);
         let target = target_id(&tab, conn);
         for c in self.clients.values_mut() {
             let ended: Vec<String> = c
@@ -368,7 +353,7 @@ impl State {
     }
 
     fn navigated(&mut self, conn: &str) {
-        self.objects.retain(|_, (c, _)| c != conn);
+        self.groups.retain(|(c, _), _| c != conn);
         self.contexts += 1;
         let id = self.contexts;
         if let Some(tab) = self.tabs.get_mut(conn) {
@@ -410,6 +395,7 @@ impl Bridge {
     }
 
     pub fn register(&self, token: &str, url: &str, title: &str, quiet: bool) {
+        self.state.lock().unwrap().bridged.insert(token.to_string());
         self.state.lock().unwrap().previews.insert(
             token.to_string(),
             Preview {
@@ -433,8 +419,11 @@ impl Bridge {
         for conn in conns {
             st.drop_tab(&conn);
         }
-        st.records
-            .retain(|r| r.get("previewToken").and_then(Value::as_str) != Some(token));
+    }
+
+    pub fn known(&self, token: &str) -> bool {
+        let st = self.state.lock().unwrap();
+        st.bridged.contains(token)
     }
 
     pub fn version_info(&self, ws: &str) -> Value {
@@ -645,21 +634,26 @@ impl Bridge {
             )),
             _ => Ok(message.get("result").cloned().unwrap_or_else(|| json!({}))),
         };
-        let outcome = if p.by_value {
-            outcome.map(unwrap_by_value)
-        } else if let Some(src) = p.source.clone() {
-            outcome.map(described).map(|mut r| {
-                if is_object(&r) {
-                    st.handles += 1;
-                    let handle = format!("{OPAQUE}-{}", st.handles);
-                    st.objects.insert(handle.clone(), (p.conn.clone(), src));
-                    r["result"]["objectId"] = json!(handle);
-                }
-                r
-            })
-        } else {
-            outcome
+        let outcome = match p.shape {
+            Shape::Raw => outcome,
+            Shape::Ignored => return,
+            Shape::Remote => outcome.and_then(|r| remote::result(&p.conn, r)),
+            Shape::Properties => outcome.and_then(|r| remote::listed(&p.conn, r)),
+            Shape::Describe => outcome.and_then(remote::described),
+            Shape::Resolve => outcome.and_then(|r| remote::resolved(&p.conn, r)),
         };
+        if let (Some(group), Ok(r)) = (&p.group, &outcome) {
+            if let Some(page) = r
+                .pointer("/result/objectId")
+                .and_then(Value::as_str)
+                .and_then(|id| remote::page_id(&p.conn, id))
+            {
+                st.groups
+                    .entry((p.conn.clone(), group.clone()))
+                    .or_default()
+                    .push(page.to_string());
+            }
+        }
         let navigated = p.method == "Page.navigate" && outcome.is_ok();
         let frame = FRAME;
         let outcome = if navigated {
@@ -1016,7 +1010,9 @@ impl Bridge {
             | "Network.enable"
             | "Network.disable"
             | "Network.setBypassServiceWorker"
-            | "Runtime.releaseObjectGroup" => Some(Ok(json!({}))),
+            | "Input.dispatchMouseEvent"
+            | "Input.dispatchKeyEvent"
+            | "Input.insertText" => Some(Ok(json!({}))),
             "Network.getAllCookies" | "Network.getCookies" | "Storage.getCookies" => {
                 Some(Ok(json!({ "cookies": [] })))
             }
@@ -1035,17 +1031,19 @@ impl Bridge {
             "Page.createIsolatedWorld" => Some(Ok(
                 json!({ "executionContextId": st.world_of(client, session) }),
             )),
-            "Runtime.getProperties" if text(&params, "objectId").starts_with(OPAQUE) => {
-                Some(Ok(json!({ "result": [] })))
-            }
             "Runtime.releaseObject" => {
-                st.objects.remove(&text(&params, "objectId"));
+                if let Some(page) = remote::page_id(&conn, &text(&params, "objectId")) {
+                    let pages = vec![page.to_string()];
+                    self.fire(&mut st, &conn, session, remote::release(&pages));
+                }
                 Some(Ok(json!({})))
             }
-            "DOM.describeNode" | "DOM.resolveNode" | "DOM.requestNode"
-                if text(&params, "objectId").starts_with(OPAQUE) =>
-            {
-                Some(Err((-32000, NO_OBJECTS.into())))
+            "Runtime.releaseObjectGroup" => {
+                let group = text(&params, "objectGroup");
+                if let Some(pages) = st.groups.remove(&(conn.clone(), group)) {
+                    self.fire(&mut st, &conn, session, remote::release(&pages));
+                }
+                Some(Ok(json!({})))
             }
             "Target.getTargetInfo" => {
                 let tab = st.tabs.get(&conn)?;
@@ -1056,63 +1054,17 @@ impl Bridge {
                 Some(Ok(json!({ "success": true })))
             }
             _ => {
-                let relay = self.next.fetch_add(1, Ordering::SeqCst) + 1;
-                let mut request = Map::new();
-                request.insert("type".into(), json!("bridge.cdp.request"));
-                request.insert("connId".into(), json!(conn));
-                request.insert("id".into(), json!(relay));
-                let (method, params) = if method == "Runtime.callFunctionOn" {
-                    let this = match params.get("objectId").and_then(Value::as_str) {
-                        Some(id) => match st.objects.get(id).filter(|(c, _)| *c == conn) {
-                            Some((_, src)) => format!(
-                                "(0, eval)({})",
-                                serde_json::to_string(src).unwrap_or_default()
-                            ),
-                            None => return Some(Err((-32000, NO_OBJECTS.into()))),
-                        },
-                        None => "undefined".into(),
-                    };
-                    let mut args = Vec::new();
-                    for arg in params
-                        .get("arguments")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                    {
-                        match argument(&st.objects, &conn, arg) {
-                            Some(a) => args.push(a),
-                            None => return Some(Err((-32000, NO_OBJECTS.into()))),
-                        }
-                    }
-                    let expression = format!(
-                        "({}).apply({this}, [{}])",
-                        text(&params, "functionDeclaration"),
-                        args.join(", ")
-                    );
-                    let mut evaluate = json!({ "expression": expression });
-                    for k in ["returnByValue", "awaitPromise", "userGesture"] {
-                        if let Some(v) = params.get(k) {
-                            evaluate[k] = v.clone();
-                        }
-                    }
-                    ("Runtime.evaluate", evaluate)
-                } else {
-                    (method, params)
+                let (sent, shape) = match translate(&conn, method, &params) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(e)),
                 };
-                let by_value = method == "Runtime.evaluate"
-                    && params.get("returnByValue") == Some(&json!(true));
-                let source = (method == "Runtime.evaluate" && !by_value)
-                    .then(|| text(&params, "expression"));
-                let mut sent = params.clone();
-                if by_value {
-                    sent["expression"] = json!(by_value_expression(&text(&params, "expression")));
-                } else if method == "Runtime.evaluate" {
-                    sent["expression"] = json!(describing_expression(&text(&params, "expression")));
-                }
-                request.insert("method".into(), json!(method));
-                request.insert("params".into(), sent);
-                request.insert("sessionId".into(), json!(session));
-                if !st.to_hub(Value::Object(request)) {
+                let group = params
+                    .get("objectGroup")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let relay = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+                let (sent_method, sent_params) = sent;
+                if !self.forward(&st, &conn, session, relay, &sent_method, sent_params) {
                     return Some(Err((
                         -32000,
                         "the relay isn't connected to the tray hub".into(),
@@ -1130,13 +1082,59 @@ impl Bridge {
                             .get("url")
                             .and_then(Value::as_str)
                             .map(str::to_string),
-                        by_value,
-                        source,
+                        shape,
+                        group,
                         at: Instant::now(),
                     },
                 );
                 None
             }
+        }
+    }
+
+    fn forward(
+        &self,
+        st: &State,
+        conn: &str,
+        session: &str,
+        relay: u64,
+        method: &str,
+        params: Value,
+    ) -> bool {
+        let mut request = Map::new();
+        request.insert("type".into(), json!("bridge.cdp.request"));
+        request.insert("connId".into(), json!(conn));
+        request.insert("id".into(), json!(relay));
+        request.insert("method".into(), json!(method));
+        request.insert("params".into(), params);
+        request.insert("sessionId".into(), json!(session));
+        st.to_hub(Value::Object(request))
+    }
+
+    fn fire(&self, st: &mut State, conn: &str, session: &str, expression: String) {
+        let relay = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.forward(
+            st,
+            conn,
+            session,
+            relay,
+            "Runtime.evaluate",
+            json!({ "expression": expression }),
+        ) {
+            st.pending.insert(
+                relay,
+                Pending {
+                    client: 0,
+                    id: Value::Null,
+                    session: session.to_string(),
+                    conn: conn.to_string(),
+                    method: "Runtime.evaluate".into(),
+                    url: None,
+                    shape: Shape::Ignored,
+                    group: None,
+                    at: Instant::now(),
+                },
+            );
         }
     }
 }

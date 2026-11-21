@@ -237,9 +237,10 @@ impl Daemon {
                 Some("publish") => self.clone().publish_op(&request, stream, reader),
                 Some("logs") => {
                     let token = request.get("previewToken").and_then(Value::as_str);
+                    let known = token.is_none_or(|t| self.bridge.known(t));
                     line(
                         &mut stream,
-                        &json!({ "ok": true, "records": self.bridge.logs(token) }),
+                        &json!({ "ok": true, "known": known, "records": self.bridge.logs(token) }),
                     );
                 }
                 Some("truncate") => {
