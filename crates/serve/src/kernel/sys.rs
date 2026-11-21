@@ -199,10 +199,10 @@ pub fn quietly<T>(marker: &str, f: impl FnOnce() -> T) -> (T, Option<String>) {
         for line in BufReader::new(file(r)).lines() {
             let Ok(line) = line else { break };
             match line.find(&marker) {
-                Some(i) if message.is_none() => {
-                    message = Some(line[i + marker.len()..].to_string())
+                Some(i) => {
+                    message.get_or_insert_with(|| line[i + marker.len()..].to_string());
                 }
-                _ => {
+                None => {
                     let _ = writeln!(out, "{line}");
                 }
             }
