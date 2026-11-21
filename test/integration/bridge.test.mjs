@@ -189,20 +189,17 @@ test('visitor tabs become CDP targets that a client drives through the hub', asy
   const evaluated = await c.send('Runtime.evaluate', { expression: '6*7' }, session);
   assert.deepEqual(evaluated.result, { result: { type: 'number', value: 42 } });
   assert.equal(evaluated.sessionId, session);
-  assert.deepEqual(tab.requests.at(-1), {
-    t: 'cdp.req',
-    id: tab.requests.at(-1).id,
-    method: 'Runtime.evaluate',
-    params: { expression: '6*7' },
-    sessionId: session,
-  });
+  const sent = tab.requests.at(-1);
+  assert.equal(sent.method, 'Runtime.evaluate');
+  assert.equal(sent.sessionId, session);
+  assert.ok(sent.params.expression.startsWith('Promise.resolve((0, eval)("6*7"))'));
   const unsupported = await c.send('DOM.describeNode', {}, session);
   assert.deepEqual(unsupported.error, {
     code: -32601,
     message: 'DOM.describeNode is not supported',
   });
   const navigated = await c.send('Page.navigate', { url: `${url}next.html` }, session);
-  assert.equal(navigated.result.frameId, 'cherry-frame');
+  assert.equal(navigated.result.frameId, 'preview-frame');
   const frame = await c.event('Page.frameNavigated', (e) => e.sessionId === session);
   assert.equal(frame.params.frame.url, `${url}next.html`);
   await c.event('Page.loadEventFired', (e) => e.sessionId === session);

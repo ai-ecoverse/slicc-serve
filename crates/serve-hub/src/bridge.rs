@@ -22,6 +22,8 @@ struct Preview {
 }
 
 struct Tab {
+    world: u64,
+    stale: bool,
     token: String,
     origin: String,
     user_agent: String,
@@ -48,6 +50,8 @@ struct Pending {
     conn: String,
     method: String,
     url: Option<String>,
+    by_value: bool,
+    source: Option<String>,
     at: Instant,
 }
 
@@ -60,6 +64,8 @@ struct State {
     pending: HashMap<u64, Pending>,
     records: VecDeque<Value>,
     contexts: u64,
+    objects: HashMap<String, (String, String)>,
+    handles: u64,
 }
 
 #[derive(Default)]
@@ -112,6 +118,117 @@ fn answer(id: &Value, outcome: Result<Value, (i64, String)>, session: Option<&st
     m.to_string()
 }
 
+fn by_value_expression(source: &str) -> String {
+    let literal = serde_json::to_string(source).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        "Promise.resolve((0, eval)({literal})).then((v) => JSON.stringify({{ t: typeof v, v }}))"
+    )
+}
+
+fn unwrap_by_value(result: Value) -> Value {
+    if result.get("exceptionDetails").is_some() {
+        return result;
+    }
+    let Some(packed) = result
+        .pointer("/result/value")
+        .and_then(Value::as_str)
+        .and_then(|t| serde_json::from_str::<Value>(t).ok())
+    else {
+        return result;
+    };
+    let kind = packed
+        .get("t")
+        .and_then(Value::as_str)
+        .unwrap_or("undefined");
+    let remote = match (kind, packed.get("v")) {
+        ("undefined", _) | (_, None) => json!({ "type": "undefined" }),
+        (_, Some(Value::Null)) => json!({ "type": "object", "subtype": "null", "value": null }),
+        (t, Some(v)) => json!({ "type": t, "value": v }),
+    };
+    json!({ "result": remote })
+}
+
+const OPAQUE: &str = "scserve-opaque";
+const NO_OBJECTS: &str = "the preview bridge can't hold objects of the visitor's page";
+
+fn describing_expression(source: &str) -> String {
+    let literal = serde_json::to_string(source).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        "Promise.resolve((0, eval)({literal})).then((v) => JSON.stringify({{ t: typeof v, \
+         s: v === null ? 'null' : Array.isArray(v) ? 'array' : v instanceof Error ? 'error' : \
+         typeof Node !== 'undefined' && v instanceof Node ? 'node' : undefined, \
+         c: v !== null && v !== undefined && v.constructor ? v.constructor.name : undefined, \
+         d: typeof v === 'function' || (v !== null && typeof v === 'object') ? String(v).slice(0, 1000) : undefined, \
+         v: v === null || typeof v === 'string' || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v)) ? v : undefined, \
+         u: typeof v === 'bigint' ? v + 'n' : typeof v === 'number' && !Number.isFinite(v) ? String(v) : undefined }}))"
+    )
+}
+
+fn described(result: Value) -> Value {
+    if result.get("exceptionDetails").is_some() {
+        return result;
+    }
+    let Some(d) = result
+        .pointer("/result/value")
+        .and_then(Value::as_str)
+        .and_then(|t| serde_json::from_str::<Value>(t).ok())
+    else {
+        return result;
+    };
+    let kind = d.get("t").and_then(Value::as_str).unwrap_or("undefined");
+    let mut remote = json!({ "type": kind });
+    for (from, to) in [
+        ("s", "subtype"),
+        ("c", "className"),
+        ("d", "description"),
+        ("u", "unserializableValue"),
+    ] {
+        if let Some(v) = d.get(from).filter(|v| !v.is_null()) {
+            remote[to] = v.clone();
+        }
+    }
+    if let Some(v) = d.get("v") {
+        if kind != "undefined" {
+            remote["value"] = v.clone();
+        }
+    }
+    if kind == "object" && d.get("s").and_then(Value::as_str) == Some("null") {
+        remote["value"] = Value::Null;
+    }
+    json!({ "result": remote })
+}
+
+fn is_object(result: &Value) -> bool {
+    matches!(
+        result.pointer("/result/type").and_then(Value::as_str),
+        Some("object" | "function")
+    ) && result.pointer("/result/subtype").and_then(Value::as_str) != Some("null")
+        && result.pointer("/result/subtype").and_then(Value::as_str) != Some("error")
+        && result.pointer("/result/objectId").is_none()
+}
+
+fn argument(
+    objects: &HashMap<String, (String, String)>,
+    conn: &str,
+    arg: &Value,
+) -> Option<String> {
+    if let Some(id) = arg.get("objectId").and_then(Value::as_str) {
+        return objects.get(id).filter(|(c, _)| c == conn).map(|(_, src)| {
+            format!(
+                "(0, eval)({})",
+                serde_json::to_string(src).unwrap_or_default()
+            )
+        });
+    }
+    if let Some(u) = arg.get("unserializableValue").and_then(Value::as_str) {
+        return Some(u.to_string());
+    }
+    match arg.get("value") {
+        Some(v) => Some(v.to_string()),
+        None => Some("undefined".into()),
+    }
+}
+
 fn cut(detail: &Value) -> String {
     let text = detail.to_string();
     if text.chars().count() > DETAIL_CHARS {
@@ -156,6 +273,7 @@ impl State {
 
     fn drop_tab(&mut self, conn: &str) -> Option<Tab> {
         let tab = self.tabs.remove(conn)?;
+        self.objects.retain(|_, (c, _)| c != conn);
         let target = target_id(&tab, conn);
         for c in self.clients.values_mut() {
             let ended: Vec<String> = c
@@ -204,34 +322,77 @@ impl State {
         }
     }
 
-    fn context(&mut self, client: u64, session: &str) {
-        let Some(conn) = self
+    fn announce(&self, client: u64, session: &str) {
+        let Some(c) = self.clients.get(&client) else {
+            return;
+        };
+        let Some(tab) = c.sessions.get(session).and_then(|s| self.tabs.get(&s.conn)) else {
+            return;
+        };
+        let id = tab.world;
+        let _ = c.tx.send(event(
+            "Runtime.executionContextCreated",
+            json!({ "context": {
+                "id": id,
+                "origin": tab.origin,
+                "name": "",
+                "uniqueId": format!("preview-{id}"),
+                "auxData": { "isDefault": true, "type": "default", "frameId": FRAME },
+            } }),
+            Some(session),
+        ));
+    }
+
+    fn enable_runtime(&mut self, client: u64, session: &str) {
+        let Some(s) = self
             .clients
-            .get(&client)
-            .and_then(|c| c.sessions.get(session))
-            .map(|s| s.conn.clone())
+            .get_mut(&client)
+            .and_then(|c| c.sessions.get_mut(session))
         else {
             return;
         };
-        let origin = self
-            .tabs
-            .get(&conn)
-            .map(|t| t.origin.clone())
-            .unwrap_or_default();
+        if s.runtime {
+            return;
+        }
+        s.runtime = true;
+        self.announce(client, session);
+    }
+
+    fn world_of(&self, client: u64, session: &str) -> u64 {
+        self.clients
+            .get(&client)
+            .and_then(|c| c.sessions.get(session))
+            .and_then(|s| self.tabs.get(&s.conn))
+            .map(|t| t.world)
+            .unwrap_or(0)
+    }
+
+    fn navigated(&mut self, conn: &str) {
+        self.objects.retain(|_, (c, _)| c != conn);
         self.contexts += 1;
         let id = self.contexts;
-        if let Some(c) = self.clients.get(&client) {
-            let _ = c.tx.send(event(
-                "Runtime.executionContextCreated",
-                json!({ "context": {
-                    "id": id,
-                    "origin": origin,
-                    "name": "",
-                    "uniqueId": format!("preview-{id}"),
-                    "auxData": { "isDefault": true, "type": "default", "frameId": FRAME },
-                } }),
-                Some(session),
-            ));
+        if let Some(tab) = self.tabs.get_mut(conn) {
+            tab.world = id;
+        }
+        let listeners: Vec<(u64, String)> = self
+            .clients
+            .iter()
+            .flat_map(|(cid, c)| {
+                c.sessions
+                    .iter()
+                    .filter(|(_, s)| s.conn == conn && s.runtime)
+                    .map(move |(sid, _)| (*cid, sid.clone()))
+            })
+            .collect();
+        for (client, session) in listeners {
+            if let Some(c) = self.clients.get(&client) {
+                let _ = c.tx.send(event(
+                    "Runtime.executionContextsCleared",
+                    json!({}),
+                    Some(&session),
+                ));
+            }
+            self.announce(client, &session);
         }
     }
 }
@@ -323,7 +484,8 @@ impl Bridge {
         }
         let replay = message.get("replay") == Some(&json!(true));
         let mut st = self.state.lock().unwrap();
-        if st.tabs.contains_key(&conn) {
+        if let Some(tab) = st.tabs.get_mut(&conn) {
+            tab.stale = false;
             return None;
         }
         let (url, title, first, quiet) = {
@@ -334,7 +496,10 @@ impl Bridge {
             }
             (p.url.clone(), p.title.clone(), first, p.quiet)
         };
+        st.contexts += 1;
         let tab = Tab {
+            world: st.contexts,
+            stale: false,
             token: token.clone(),
             origin: text(message, "origin"),
             user_agent: text(message, "userAgent"),
@@ -430,6 +595,41 @@ impl Bridge {
         Some(record)
     }
 
+    pub fn relinking(&self) {
+        for tab in self.state.lock().unwrap().tabs.values_mut() {
+            tab.stale = true;
+        }
+    }
+
+    pub fn drop_stale(&self) -> Vec<Value> {
+        let mut st = self.state.lock().unwrap();
+        let stale: Vec<String> = st
+            .tabs
+            .iter()
+            .filter(|(_, t)| t.stale)
+            .map(|(c, _)| c.clone())
+            .collect();
+        let mut gone = Vec::new();
+        for conn in stale {
+            let Some(tab) = st.drop_tab(&conn) else {
+                continue;
+            };
+            let record = json!({
+                "at": now(),
+                "event": "disconnected",
+                "previewToken": tab.token,
+                "connId": conn,
+                "announced": false,
+                "origin": tab.origin,
+                "userAgent": tab.user_agent,
+                "reason": "the tray hub no longer had it after the relay reconnected",
+            });
+            st.record(record.clone());
+            gone.push(record);
+        }
+        gone
+    }
+
     pub fn responded(&self, message: &Value) {
         let Some(id) = message.get("id").and_then(Value::as_u64) else {
             return;
@@ -445,13 +645,28 @@ impl Bridge {
             )),
             _ => Ok(message.get("result").cloned().unwrap_or_else(|| json!({}))),
         };
+        let outcome = if p.by_value {
+            outcome.map(unwrap_by_value)
+        } else if let Some(src) = p.source.clone() {
+            outcome.map(described).map(|mut r| {
+                if is_object(&r) {
+                    st.handles += 1;
+                    let handle = format!("{OPAQUE}-{}", st.handles);
+                    st.objects.insert(handle.clone(), (p.conn.clone(), src));
+                    r["result"]["objectId"] = json!(handle);
+                }
+                r
+            })
+        } else {
+            outcome
+        };
         let navigated = p.method == "Page.navigate" && outcome.is_ok();
-        let frame = outcome
-            .as_ref()
-            .ok()
-            .and_then(|r| r.get("frameId").and_then(Value::as_str))
-            .unwrap_or(FRAME)
-            .to_string();
+        let frame = FRAME;
+        let outcome = if navigated {
+            outcome.map(|_| json!({ "frameId": frame, "loaderId": LOADER }))
+        } else {
+            outcome
+        };
         if let Some(c) = st.clients.get(&p.client) {
             let _ = c.tx.send(answer(&p.id, outcome, Some(&p.session)));
         }
@@ -476,31 +691,31 @@ impl Bridge {
             .get(&p.conn)
             .map(|t| t.origin.clone())
             .unwrap_or_default();
-        let runtime = st
+        let sessions: Vec<(Sender<String>, String)> = st
             .clients
-            .get(&p.client)
-            .and_then(|c| c.sessions.get(&p.session))
-            .is_some_and(|s| s.runtime);
-        let Some(tx) = st.clients.get(&p.client).map(|c| c.tx.clone()) else {
-            return;
-        };
-        let s = Some(p.session.as_str());
-        if runtime {
-            let _ = tx.send(event("Runtime.executionContextsCleared", json!({}), s));
+            .values()
+            .flat_map(|c| {
+                c.sessions
+                    .iter()
+                    .filter(|(_, s)| s.conn == p.conn)
+                    .map(|(sid, _)| (c.tx.clone(), sid.clone()))
+            })
+            .collect();
+        for (tx, sid) in &sessions {
+            let _ = tx.send(event(
+                "Page.frameNavigated",
+                json!({ "frame": { "id": frame, "loaderId": LOADER, "url": url, "securityOrigin": origin, "mimeType": "text/html" }, "type": "Navigation" }),
+                Some(sid),
+            ));
         }
-        let _ = tx.send(event(
-            "Page.frameNavigated",
-            json!({ "frame": { "id": frame, "loaderId": LOADER, "url": url, "securityOrigin": origin, "mimeType": "text/html" }, "type": "Navigation" }),
-            s,
-        ));
-        if runtime {
-            st.context(p.client, &p.session);
+        st.navigated(&p.conn);
+        for (tx, sid) in &sessions {
+            let _ = tx.send(event(
+                "Page.loadEventFired",
+                json!({ "timestamp": serve_core::time::now_ms() as f64 / 1000.0 }),
+                Some(sid),
+            ));
         }
-        let _ = tx.send(event(
-            "Page.loadEventFired",
-            json!({ "timestamp": serve_core::time::now_ms() as f64 / 1000.0 }),
-            s,
-        ));
     }
 
     pub fn expire(&self) {
@@ -728,6 +943,22 @@ impl Bridge {
                     None => Err((-32602, "No target with given id found".into())),
                 }
             }
+            "Target.getTargetInfo" => {
+                let target = text(params, "targetId");
+                match st
+                    .tabs
+                    .iter()
+                    .find(|(conn, t)| target.is_empty() || target_id(t, conn) == target)
+                {
+                    Some((conn, t)) if !target.is_empty() => {
+                        Ok(json!({ "targetInfo": info(t, conn, attached(&st, conn)) }))
+                    }
+                    _ if target.is_empty() => Ok(json!({ "targetInfo": {
+                        "targetId": "browser", "type": "browser", "title": "", "url": "", "attached": true,
+                    } })),
+                    _ => Err((-32602, "No target with given id found".into())),
+                }
+            }
             "Target.getBrowserContexts" => Ok(json!({ "browserContextIds": [] })),
             "Target.activateTarget" => Ok(json!({})),
             "Target.createTarget" | "Target.createBrowserContext" | "Browser.close" => {
@@ -757,8 +988,8 @@ impl Bridge {
                 format!("Session with given id not found: {session}"),
             )));
         };
-        let (url, origin) = match st.tabs.get(&conn) {
-            Some(t) => (t.url.clone(), t.origin.clone()),
+        let (url, origin, frame) = match st.tabs.get(&conn) {
+            Some(t) => (t.url.clone(), t.origin.clone(), FRAME),
             None => return Some(Err((-32000, GONE.into()))),
         };
         let set_runtime = |st: &mut State, on: bool| {
@@ -778,26 +1009,48 @@ impl Bridge {
             | "DOM.enable"
             | "Page.bringToFront"
             | "Runtime.runIfWaitingForDebugger"
-            | "Target.setAutoAttach" => Some(Ok(json!({}))),
+            | "Target.setAutoAttach"
+            | "Inspector.enable"
+            | "Fetch.enable"
+            | "Fetch.disable"
+            | "Network.enable"
+            | "Network.disable"
+            | "Network.setBypassServiceWorker"
+            | "Runtime.releaseObjectGroup" => Some(Ok(json!({}))),
+            "Network.getAllCookies" | "Network.getCookies" | "Storage.getCookies" => {
+                Some(Ok(json!({ "cookies": [] })))
+            }
             "Runtime.disable" => {
                 set_runtime(&mut st, false);
                 Some(Ok(json!({})))
             }
             "Runtime.enable" => {
-                if !set_runtime(&mut st, true) {
-                    if let Some(c) = st.clients.get(&client) {
-                        let _ = c.tx.send(answer(id, Ok(json!({})), Some(session)));
-                    }
-                    st.context(client, session);
-                    return None;
-                }
+                st.enable_runtime(client, session);
                 Some(Ok(json!({})))
             }
             "Page.getFrameTree" => Some(Ok(json!({ "frameTree": {
-                "frame": { "id": FRAME, "loaderId": LOADER, "url": url, "securityOrigin": origin, "mimeType": "text/html" },
+                "frame": { "id": frame, "loaderId": LOADER, "url": url, "securityOrigin": origin, "mimeType": "text/html" },
                 "childFrames": [],
             } }))),
-            "Page.createIsolatedWorld" => Some(Ok(json!({ "executionContextId": 1 }))),
+            "Page.createIsolatedWorld" => Some(Ok(
+                json!({ "executionContextId": st.world_of(client, session) }),
+            )),
+            "Runtime.getProperties" if text(&params, "objectId").starts_with(OPAQUE) => {
+                Some(Ok(json!({ "result": [] })))
+            }
+            "Runtime.releaseObject" => {
+                st.objects.remove(&text(&params, "objectId"));
+                Some(Ok(json!({})))
+            }
+            "DOM.describeNode" | "DOM.resolveNode" | "DOM.requestNode"
+                if text(&params, "objectId").starts_with(OPAQUE) =>
+            {
+                Some(Err((-32000, NO_OBJECTS.into())))
+            }
+            "Target.getTargetInfo" => {
+                let tab = st.tabs.get(&conn)?;
+                Some(Ok(json!({ "targetInfo": info(tab, &conn, true) })))
+            }
             "Target.closeTarget" => {
                 st.to_hub(json!({ "type": "bridge.close", "connId": conn }));
                 Some(Ok(json!({ "success": true })))
@@ -808,8 +1061,56 @@ impl Bridge {
                 request.insert("type".into(), json!("bridge.cdp.request"));
                 request.insert("connId".into(), json!(conn));
                 request.insert("id".into(), json!(relay));
+                let (method, params) = if method == "Runtime.callFunctionOn" {
+                    let this = match params.get("objectId").and_then(Value::as_str) {
+                        Some(id) => match st.objects.get(id).filter(|(c, _)| *c == conn) {
+                            Some((_, src)) => format!(
+                                "(0, eval)({})",
+                                serde_json::to_string(src).unwrap_or_default()
+                            ),
+                            None => return Some(Err((-32000, NO_OBJECTS.into()))),
+                        },
+                        None => "undefined".into(),
+                    };
+                    let mut args = Vec::new();
+                    for arg in params
+                        .get("arguments")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        match argument(&st.objects, &conn, arg) {
+                            Some(a) => args.push(a),
+                            None => return Some(Err((-32000, NO_OBJECTS.into()))),
+                        }
+                    }
+                    let expression = format!(
+                        "({}).apply({this}, [{}])",
+                        text(&params, "functionDeclaration"),
+                        args.join(", ")
+                    );
+                    let mut evaluate = json!({ "expression": expression });
+                    for k in ["returnByValue", "awaitPromise", "userGesture"] {
+                        if let Some(v) = params.get(k) {
+                            evaluate[k] = v.clone();
+                        }
+                    }
+                    ("Runtime.evaluate", evaluate)
+                } else {
+                    (method, params)
+                };
+                let by_value = method == "Runtime.evaluate"
+                    && params.get("returnByValue") == Some(&json!(true));
+                let source = (method == "Runtime.evaluate" && !by_value)
+                    .then(|| text(&params, "expression"));
+                let mut sent = params.clone();
+                if by_value {
+                    sent["expression"] = json!(by_value_expression(&text(&params, "expression")));
+                } else if method == "Runtime.evaluate" {
+                    sent["expression"] = json!(describing_expression(&text(&params, "expression")));
+                }
                 request.insert("method".into(), json!(method));
-                request.insert("params".into(), params.clone());
+                request.insert("params".into(), sent);
                 request.insert("sessionId".into(), json!(session));
                 if !st.to_hub(Value::Object(request)) {
                     return Some(Err((
@@ -829,6 +1130,8 @@ impl Bridge {
                             .get("url")
                             .and_then(Value::as_str)
                             .map(str::to_string),
+                        by_value,
+                        source,
                         at: Instant::now(),
                     },
                 );

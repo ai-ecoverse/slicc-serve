@@ -24,6 +24,7 @@ use tungstenite::Message;
 
 pub const IDLE: Duration = Duration::from_secs(5);
 const PING: Duration = Duration::from_secs(30);
+const RELINK: Duration = Duration::from_secs(3);
 const RECONNECT: [u64; 5] = [1, 2, 5, 10, 30];
 
 pub struct Failure {
@@ -517,7 +518,15 @@ impl Daemon {
         self.store.remember(&tray);
         let socket = ws::connect(&self.hub, &url)?;
         let (out, rx) = channel();
+        self.bridge.relinking();
         self.bridge.set_hub(out.clone());
+        let me = self.self_arc();
+        std::thread::spawn(move || {
+            std::thread::sleep(RELINK);
+            for ev in me.bridge.drop_stale() {
+                me.tell(&ev);
+            }
+        });
         let alive = Arc::new(AtomicBool::new(true));
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let previous = self.link.lock().unwrap().replace(Link {
