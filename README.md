@@ -39,8 +39,11 @@ Binaries: macOS (arm64, x86-64, signed and notarized), Linux (arm64, x86-64, sta
 ```
 scserve [--entry FILE] [--ttl DURATION] [--local] [--foreground] [--open] [--json] DIRECTORY
 scserve --port PORT [--entry PATH] [--local] [--foreground] [--open] [--json]
+scserve --bridge [--max-tabs N] [--quiet] [other options] DIRECTORY | --port PORT
 scserve --list [--json]
 scserve --stop TOKEN|URL|PORT [--json]
+scserve --logs [TOKEN|URL] [--lines N] [--json]
+scserve --truncate [TOKEN|URL] [--json]
 scserve --version | --upgrade | --help
 ```
 
@@ -54,15 +57,22 @@ scserve --version | --upgrade | --help
 | `--foreground` | stays attached instead of returning; Ctrl-C (or the end of the process) stops the preview |
 | `--open` | opens the URL with the platform's opener once it is published (and a sign-in page, see [The tray hub](#the-tray-hub)) |
 | `--json` | prints the result, or the error, as one JSON object (an array for `--list`) |
+| `--bridge` | makes every visitor's tab a target that a CDP client on this machine can drive, and passes the page's `window.slicc.emit()` calls on (see [The bridge](#the-bridge---bridge)) |
+| `--no-bridge` | the default: no bridge |
+| `--max-tabs N` | with `--bridge`: at most `N` visitor tabs bridged at once, 1 to 100 (default 20); the hub refuses more |
+| `--quiet` | with `--bridge`: no first-visit announcement (the visit is still recorded for `--logs`) |
+| `--logs [TOKEN\|URL]` | prints the bridge's lifecycle records (connects, disconnects, emits), of one preview or of all |
+| `--lines N` | with `--logs`: only the newest `N` records |
+| `--truncate [TOKEN\|URL]` | clears those records and re-arms the first-visit announcement |
 | `--list` | lists the previews this machine published |
 | `--stop TOKEN\|URL\|PORT` | stops a preview, by its token, its public URL, its local URL or its local port |
 | `--version` | prints the version alone (`1.2.0`) |
 | `--upgrade` | see [`--upgrade`](#--upgrade) |
 | `-h`, `--help` | prints the usage and the options to stdout and exits 0, wherever it appears among the options |
 
-Options come before or after the directory; `--name=value` works for options with a value, and `--` ends the options. Give a directory or `--port`, not both and not neither. `--ttl` needs a directory and is neither `--local` nor `--foreground`. `--list` and `--stop` take only `--json`; `--version` and `--upgrade` take nothing else. `--entry` must stay inside the directory: no leading `/` or `\`, no `..`, no `:`; `./` and doubled slashes are dropped, and `\` counts as `/`.
+Options come before or after the directory; `--name=value` works for options with a value, and `--` ends the options. Give a directory or `--port`, not both and not neither. `--ttl` needs a directory and is neither `--local` nor `--foreground`. `--list` and `--stop` take only `--json`, `--logs` only a target, `--lines` and `--json`, `--truncate` only a target and `--json`; `--version` and `--upgrade` take nothing else. `--bridge` is neither `--ttl` (a snapshot has no visitor sockets) nor `--local`, and not with `--no-bridge`; `--max-tabs` and `--quiet` need `--bridge`. `--entry` must stay inside the directory: no leading `/` or `\`, no `..`, no `:`; `./` and doubled slashes are dropped, and `\` counts as `/`.
 
-Slicc 6's `--bridge`, `--no-bridge`, `--max-tabs`, `--quiet`, `--logs`, `--lines` and `--truncate` are recognised and refused with `scserve: <option> is not supported yet` (exit 2); they come with the bridge work ([#1](https://github.com/ai-ecoverse/slicc-serve/issues/1), M5). `--project` is refused with `scserve: --project is obsolete: give the directory to serve itself`.
+`--project` is refused with `scserve: --project is obsolete: give the directory to serve itself`.
 
 ### Exit status
 
@@ -130,6 +140,45 @@ The hub sends `preview.request {reqId, servedRoot, vfsPath, asText, range?}`; th
 
 `--stop` takes a preview token, a public URL (its host encodes the token, as slicc 6's `previewTokenFromUrl` reads it), a local URL, a port or a record id. A local URL matches by its port when its host is a loopback name (`127.0.0.1`, any `127.x.y.z`, `localhost`, `*.localhost`), so `http://localhost:61489/` and `61489` both stop the preview served on `127.0.0.1:61489`; a port matches a preview's static server or the server a `--port` preview publishes. When several previews match, it stops none and exits 1 with `scserve: X matches N previews; stop one by its token`. A hub preview is stopped with the tray that minted it (`POST /api/tray/<trayId>/preview/stop`); the relay then gets `preview.revoked` and stops its server. A local preview is stopped through the relay. It prints `stopped <token or URL>`; `scserve: no preview matches X`, `scserve: <token> is not a preview of this machine's trays` and `scserve: the tray hub has no preview <token> (already stopped or expired)` exit 1.
 
+## The bridge (`--bridge`)
+
+`scserve --bridge ./app` is slicc 6's `serve --bridge` on a host: every tab a visitor opens on the public URL becomes a CDP target on this machine, `preview:<token>:<connId>`, that a CDP client (playwright-cli, a script with `chrome-remote-interface`) can evaluate in, query, click, type into, screenshot and navigate, and the page's `window.slicc.emit(name, detail)` calls arrive here. Nothing on the hub changes: the hub already injects the bridge's bootstrap into a bridged preview's HTML (`<script src="/__slicc/preview-bridge.js">`), holds one `/__slicc/bridge` WebSocket per visitor tab, and relays between those sockets and the tray's leader. `scserve` is that leader.
+
+```
+visitor tab ──wss /__slicc/bridge──► tray hub ──controller WS──► relay ◄──ws──── CDP client
+  (bootstrap answers cdp.req)          bridge.connected / .disconnected          http://127.0.0.1:<port>/<secret>/
+                                       bridge.cdp.request / .response / .close
+                                       webhook.event (emits)
+```
+
+**The mint** of a bridged preview adds `bridge: true`, `maxTabs` (`--max-tabs`, default 20), `quiet` (`--quiet`) and `webhookId: "scserve-<record id>"` to `POST /api/tray/<id>/preview`. The hub routes the preview's emits to the leader as `webhook.event` with that `webhookId`, which is all the id is for: the hub doesn't look it up.
+
+**The CDP endpoint.** The relay runs one CDP server for all its bridged previews, on `127.0.0.1` with a random port (never 9222 to 9229), from the first bridged preview until the relay exits. Every path carries a 32-hex-digit secret, made fresh each time the relay starts and kept in `relay.json` (`0600`); a request without it is `404`, one whose `Host` isn't `127.0.0.1:<port>` or `localhost:<port>` is `403` (no DNS rebinding), and a WebSocket upgrade with an `Origin` header of a web page is `403`. So a page in the user's browser can't reach it, and neither can another user of the machine who doesn't hold the secret.
+
+| path | answers |
+| --- | --- |
+| `GET /<secret>/json/version` | `{"Browser": "scserve/<version>", "Protocol-Version": "1.3", "webSocketDebuggerUrl": "ws://127.0.0.1:<port>/<secret>/devtools/browser"}` |
+| `GET /<secret>/json/list`, `/<secret>/json` | one entry per bridged tab: `{"id": "preview:<token>:<connId>", "type": "page", "title": <the preview's directory, or 127.0.0.1:PORT>, "url": <the preview's public URL; the hub doesn't say which page the tab is on>, "description": "<origin> <userAgent>"}`; no per-target sockets |
+| `GET /<secret>/devtools/browser` (WebSocket) | a browser-level CDP connection, below |
+
+`scserve --bridge` prints the endpoint with the URL (`scserve: its visitor tabs are CDP targets at http://127.0.0.1:<port>/<secret>/`), and `--json` and `--list --json` give it as `cdpUrl`. The secret is a capability: anyone who has the URL can drive the bridged tabs while the relay runs.
+
+**The browser connection** emulates the `Target` domain over the bridged tabs, with Chrome's flattened sessions:
+
+- `Target.getTargets` lists the tabs (`type: "page"`, `attached` when a session is on it); `Target.setDiscoverTargets {discover: true}` sends `Target.targetCreated` for each tab there is and each that connects, and `Target.targetDestroyed` for each that goes; `Target.attachToTarget {targetId, flatten: true}` answers a `sessionId` and sends `Target.attachedToTarget`; `Target.setAutoAttach` attaches every tab there is and every new one; `Target.detachFromTarget` ends a session (`Target.detachedFromTarget`); `Target.closeTarget` closes the visitor's bridge (`bridge.close`). `Target.createTarget`, `Target.createBrowserContext` and `Browser.close` are `-32000`, `a preview bridge can't open or close the visitor's browser`; `Browser.getVersion` answers as `/json/version`; any other method without a `sessionId` is `-32601`.
+- **In a session**, as slicc 6's `PreviewBridgeCdpTransport` and `SyntheticCdpTransport` do: `Page.enable`, `DOM.enable`, `Page.bringToFront`, `Runtime.disable`, `Runtime.runIfWaitingForDebugger` and `Target.setAutoAttach` answer `{}`; `Runtime.enable` answers `{}` and sends `Runtime.executionContextCreated` for the main world (once per enable); `Page.getFrameTree` and `Page.createIsolatedWorld` answer from the tab's URL and origin. Everything else goes to the tab as `bridge.cdp.request {connId, id, method, params, sessionId}`, and the tab's `bridge.cdp.response` is the answer. The bootstrap answers `Runtime.evaluate`, `DOM.getDocument`, `DOM.querySelector`, `DOM.getBoxModel`, `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`, `Page.captureScreenshot` (html2canvas), `Page.navigate` and `Target.createTarget` (it opens the URL), and `-32601` for the rest. After a `Page.navigate`, the relay sends `Page.frameNavigated`, a new execution context (when `Runtime` is on) and `Page.loadEventFired`, as slicc 6 does, since the hub relays no CDP events from the tab. A tab that doesn't answer within 30 s is `-32000`, `the visitor's tab didn't answer within 30 s`; a tab that is gone, `-32000`, `the visitor's tab is gone` (the hub's `Preview bridge connection is gone`).
+- When a tab disconnects, its sessions end (`Target.detachedFromTarget`, `Target.targetDestroyed`) and its pending calls fail. When the preview stops, the hub closes its tabs' sockets. A CDP client closing its socket detaches its sessions and changes nothing for the visitor.
+
+**The lifecycle records.** The relay keeps the last 500 records of all its bridged previews, in memory (they are gone when the relay exits): `connected` (with the visitor's `origin`, `userAgent` and `connectedAt`), `disconnected` (with the `reason` when the hub gives one) and `emit` (the `name` and the `detail`, as JSON, cut to 1,000 characters). An emit, like a visitor's `origin`, `userAgent` and `reason`, is untrusted text from a stranger's browser; the hub already limits each emit to 16 KiB and 20 per tab every 10 s. Every line `scserve` prints for a person (`--foreground`'s event lines, `--logs`, the first-visit line) writes those fields with control characters (C0, DEL and C1) escaped as JSON escapes them (`\u001b`), so a visitor can't send escape sequences to the terminal; `--json` output is JSON already.
+
+**The first visit.** The first tab that connects to a preview is announced, unless the preview is `--quiet`: its record is `announced` (the others `suppressed`), a `--foreground` `scserve` prints `scserve: first visitor on <url>: <origin> (<userAgent>)`, and the relay sends `preview.state.update {previewToken, announced: true}`, so the hub keeps the latch across relay restarts (it replays `preview.state {previewToken, quiet, announced}` to a leader that connects, with `bridge.connected {…, replay: true}` for tabs already there, which are neither recorded nor announced again).
+
+**Where events go:**
+
+- A `--foreground` `scserve --bridge` prints one line per event to stderr, `scserve: connected <connId> <origin> <userAgent>`, `scserve: disconnected <connId> <reason>`, `scserve: emit <connId> <name> <detail>`; with `--json`, stdout has one JSON object per event after the record: `{"event": "connected"|"disconnected"|"emit", "previewToken", "connId", "at", …}`, the record's fields.
+- `scserve --logs [TOKEN|URL] [--lines N]` asks the relay for them: `Preview lifecycle records (oldest to newest):`, then `<at>  <event>  <announced|suppressed|->  preview=<token> conn=<connId> <origin=… userAgent=…|reason=…|name=… detail=…>` per record, or `no lifecycle records (the relay keeps them in memory, so they are gone when it restarts)`; `--json` prints the array. A target that matches no bridged preview is `scserve: no preview matches X` (exit 1); no relay running is no records.
+- `scserve --truncate [TOKEN|URL]` clears them (of that preview, or all), re-arms the first-visit announcement of each matching bridged preview (`preview.state.update {announced: false}`), and prints `cleared <n> records, re-armed <m> previews` (`--json`: `{"cleared": n, "rearmed": m}`).
+
 ## The tray hub
 
 `scserve` talks to the tray hub at `https://www.sliccy.ai` (`SLICC_TRAY_HUB` replaces it, for tests and staging) with the same API as slicc 6 and seven. Nothing on the hub changes for it:
@@ -160,7 +209,7 @@ The controller token goes in `Authorization: Bearer` to the hub's origin only. A
 | --- | --- |
 | `<config>/tray.json` (`0600`) | the current tray (`hub`, `trayId`, `controllerToken`, `controllerUrl`, `controllerId`, `leaderKey`) and retired trays that still hold snapshots |
 | `<state>/previews/<id>.json` (`0600`) | one record per preview: what `--json` prints, plus the relay's pid |
-| `<state>/relay.json` (`0600`), `relay.lock`, `relay.log` | the running relay's pid, control port and token |
+| `<state>/relay.json` (`0600`), `relay.lock`, `relay.log` | the running relay's pid, control port and token, and once a bridged preview is up its CDP port and secret |
 
 `<config>` is `$XDG_CONFIG_HOME/slicc/serve` (default `~/.config/slicc/serve`), `%APPDATA%\slicc\serve` on Windows; `<state>` is `$XDG_STATE_HOME/slicc/serve` (default `~/.local/state/slicc/serve`), `%LOCALAPPDATA%\slicc\serve` on Windows. `SCSERVE_CONFIG_DIR` and `SCSERVE_STATE_DIR` replace them. Directories are `0700`; files are written to a temporary name and renamed.
 
@@ -237,6 +286,8 @@ This is what seven's page answers ([#6](https://github.com/ai-ecoverse/slicc-ser
 | `serve.list` | none | `O_RDWR` | one JSON line per preview, then end-of-file; nothing when there are none | `ENOTSUP`, `EIO` |
 | `serve.stop` | `previewToken` | `O_WRONLY` | none; the close returns the errno | `ENOENT`, `ENOTSUP`, `EIO` |
 | `serve.snapshot` | `root`, `entry`, `ttlMs`, `files`, `bytes` | `O_RDWR` | after the body: one JSON line, `{"url","previewToken","expiresAt",…}` or `{"error",…}`, then end-of-file | `EACCES`, `ENOTSUP`, `EIO` |
+| `serve.logs` | `previewToken` (optional) | `O_RDWR` | one JSON line per lifecycle record, oldest first, then end-of-file | `ENOENT`, `ENOTSUP` |
+| `serve.truncate` | `previewToken` (optional) | `O_RDWR` | one JSON line `{"cleared", "rearmed"}` | `ENOENT`, `ENOTSUP` |
 
 #### `serve.publish`
 
@@ -251,6 +302,9 @@ This is what seven's page answers ([#6](https://github.com/ai-ecoverse/slicc-ser
 | `root` | string: the directory's absolute path in the kernel, for the prompt and the chip only; absent with `--port`. The page never reads files: every visit goes to `port` |
 | `entry` | string, absent without `--entry`: the `--entry` path as `serve` normalized it (segments joined by `/`; no empty, `.` or `..` segment; no leading `/`; no `\`, `:` or NUL). The page refuses anything else, and a `port` outside 1 to 65535, with an `EIO` error (`invalid entry`, `invalid port`) |
 | `allowLive` | boolean: `true` for `--port` (the hub doesn't edge-cache it), `false` for a directory (the hub's 5 s edge cache); `serve` always sends it, and the page takes `true` when it is missing |
+| `bridge` | `true` with `--bridge`, else absent: see [The bridge in seven](#the-bridge-in-seven) |
+| `maxTabs` | number, 1 to 100, with `bridge` only (default 20) |
+| `quiet` | `true` with `--quiet`, with `bridge` only |
 
 What the page does, in order:
 
@@ -321,6 +375,17 @@ When it fails, the page answers at once, without reading the rest of the body: w
 - **The hub answered a failure** to the mint, an upload or the finalize: the page stops a minted snapshot, and the reply is the failure line of `serve.publish` (`{"error", "status", "code"?, "retryAfter"?, "signIn"?, "active"?, "limit"?}`), with `"during": "mint"`, `"upload"` or `"finalize"`, and for an upload `"path"`. `serve` says `publishing the snapshot` for the mint and `uploading the snapshot` otherwise, adds ` (<path>)` to the hub's error for an upload, and maps the status to exits 1, 3 and 4 as for `serve.publish`. `PREVIEW_LIMIT` (`429`, the tray's 10 snapshots) is exit 4.
 - **The hub can't be reached:** the page stops a minted snapshot if it can, and throws an `EIO` error with the reason.
 - **`serve` goes away** before the reply (Ctrl-C, `kill`): the kernel aborts the request, and the page stops the snapshot on the hub unless it had already written its reply, a finalize still in flight included, since `serve` never got the URL. A snapshot whose reply the page had written stays (`serve` may have exited before reading it), and `serve --list` shows it from `serve.list`.
+
+### The bridge in seven
+
+`serve --bridge DIR` in seven is the same preview, with seven's page as the leader that the hub's `bridge.*` messages reach. `serve` sends `bridge`, `maxTabs` and `quiet` with `serve.publish`, and the options and output are the host's, except that the targets show up on seven's own CDP endpoint instead of a local one: `serve: its visitor tabs are CDP targets preview:<token>:* on $SLICC_CDP_URL`. What the page does:
+
+1. **The mint** adds `bridge: true`, `maxTabs`, `quiet` and `webhookId: "serve-<16 hex>"` (a fresh name for each preview, matching seven's webhook names) to the mint. The prompt says so: "Publish /home/me/app at a public URL, and let the agent drive the tabs of whoever opens it?" The reply's first line adds `"webhook": "serve-<16 hex>"`, which `serve` prints.
+2. **Visitor tabs as targets.** For each `bridge.connected` of a preview the page holds, the page adds a target `preview:<token>:<connId>` (`type: "page"`, the preview's URL and the connection's origin, as on a host) to the `Target` domain its CDP hook emulates for kernel programs (`SLICC_CDP_URL`), and drops it on `bridge.disconnected` or when the preview stops. It answers in a session exactly as the host's relay does ([The bridge](#the-bridge---bridge)): the same synthetic methods and navigation events, everything else as `bridge.cdp.request` over the tray's controller socket, the same errors and the same 30 s timeout; `Target.closeTarget` sends `bridge.close`. The targets pass the same guard as seven's other targets: a connection seven wouldn't let drive a tab doesn't see them, and whatever seven asks before an agent drives a tab, it asks here. `bridge.connected` with `replay: true` restores a target without recording or announcing it. A `bridge.cdp.response` for a `connId` the page doesn't know is dropped.
+3. **Emits** arrive as `webhook.event {webhookId: "serve-…", headers: {"x-slicc-preview-conn", "x-slicc-preview-token"}, body: {name, detail}}`, which seven already delivers to the agent as a webhook of that name. The page delivers them only while it holds the preview, and drops them after it stopped.
+4. **The first visit** of a preview that isn't `quiet` is delivered to the agent on the same webhook, as a delivery with the header `x-slicc-preview-lifecycle: connected`, the headers above and the body `{"origin", "userAgent", "connectedAt"}`; then the page sends `preview.state.update {previewToken, announced: true}`. The page restores `quiet` and `announced` from the hub's `preview.state` when it connects.
+5. **Lifecycle records:** the page keeps the last 500 records of the previews it holds from `serve.publish`, in memory, with the host's fields (`at`, `event`, `previewToken`, `connId`, `announced`, `origin`, `userAgent`, `connectedAt`, `reason`, `name`, `detail` cut to 1,000 characters). `serve.logs` answers them as JSON lines, of one preview or of all, filtered by uid as `serve.list` is (a `previewToken` the caller can't see is `ENOENT`, `seven holds no preview <token>`); `serve.truncate` clears them and re-arms the announcement (`preview.state.update {announced: false}`), and answers `{"cleared", "rearmed"}`. `serve --logs` and `serve --truncate` print them as on a host.
+6. **`--foreground`** gets each event as a line of the held `serve.publish` reply after the first, `{"event": "connected"|"disconnected"|"emit", …}` with the record's fields, and prints it as a host `--foreground` does; a detached `serve`'s reply gets the same lines and ignores them. A `serve` built before the bridge reads only `stopped` from those lines, and ignores the rest.
 
 ## Development
 
