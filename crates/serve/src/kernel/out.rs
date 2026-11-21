@@ -166,6 +166,13 @@ fn size(bytes: u64) -> String {
     }
 }
 
+fn bridged(cmd: &str, record: &Record) {
+    if let (true, Some(token)) = (record.bridge, &record.preview_token) {
+        let on = record.cdp_url.as_deref().unwrap_or("$SLICC_CDP_URL");
+        eprintln!("{cmd}: its visitor tabs are CDP targets preview:{token}:* on {on}");
+    }
+}
+
 pub fn done(cmd: &str, record: &Record, opts: &Serve) -> i32 {
     snapshot_done(cmd, record, opts, None)
 }
@@ -208,9 +215,13 @@ pub fn snapshot_done(cmd: &str, record: &Record, opts: &Serve, extra: Option<(us
                     .map(|l| format!(" (here: {l})"))
                     .unwrap_or_default();
                 eprintln!("{cmd}: {what} is public at {url}{here}");
+                bridged(cmd, record);
                 eprintln!("{cmd}: stop it with: {cmd} --stop {token}");
             }
-            (Some(_), true) => eprintln!("{cmd}: {what} is public at {url}; Ctrl-C stops it"),
+            (Some(_), true) => {
+                eprintln!("{cmd}: {what} is public at {url}; Ctrl-C stops it");
+                bridged(cmd, record);
+            }
             (None, false) if record.root.is_some() => {
                 eprintln!("{cmd}: serving {what} at {url}; stop it with: {cmd} --stop {url}")
             }

@@ -157,3 +157,87 @@ pub fn stop(cmd: &str, target: &str, json: bool) -> i32 {
     }
     0
 }
+
+fn target_token(cmd: &str, target: Option<&str>, json: bool) -> Result<Option<String>, i32> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let found = match record::find(Store::new().living(), target) {
+        Found::One(r) => r.preview_token,
+        _ => None,
+    };
+    match found
+        .or_else(|| token::from_url(target))
+        .or_else(|| token::is_token(target).then(|| target.to_string()))
+    {
+        Some(t) => Ok(Some(t)),
+        None => Err(out::fail(
+            &Failure::plain(format!("{cmd}: no preview matches {target}")),
+            json,
+        )),
+    }
+}
+
+pub fn logs(cmd: &str, target: Option<&str>, lines: Option<usize>, json: bool) -> i32 {
+    let token = match target_token(cmd, target, json) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let mut request = json!({ "kind": "serve.logs" });
+    if let Some(t) = &token {
+        request["previewToken"] = json!(t);
+    }
+    let reply = match embedder::exchange(&request) {
+        Ok(r) => r,
+        Err(e) => return out::fail(&Failure::page(cmd, &e), json),
+    };
+    let mut records: Vec<Value> = reply
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(Value::is_object)
+        .collect();
+    if let Some(n) = lines {
+        let skip = records.len().saturating_sub(n);
+        records.drain(..skip);
+    }
+    if json {
+        println!("{}", Value::Array(records));
+    } else if records.is_empty() {
+        println!(
+            "no lifecycle records (seven keeps them in memory, so they are gone when it reloads)"
+        );
+    } else {
+        println!("Preview lifecycle records (oldest to newest):");
+        for r in &records {
+            println!("{}", serve_core::table::log_line(r));
+        }
+    }
+    0
+}
+
+pub fn truncate(cmd: &str, target: Option<&str>, json: bool) -> i32 {
+    let token = match target_token(cmd, target, json) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let mut request = json!({ "kind": "serve.truncate" });
+    if let Some(t) = &token {
+        request["previewToken"] = json!(t);
+    }
+    let reply = match embedder::exchange(&request) {
+        Ok(r) => r,
+        Err(e) => return out::fail(&Failure::page(cmd, &e), json),
+    };
+    let answer: Value = reply
+        .lines()
+        .find_map(|l| serde_json::from_str(l).ok())
+        .unwrap_or(Value::Null);
+    let count = |k: &str| answer.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let (cleared, rearmed) = (count("cleared"), count("rearmed"));
+    if json {
+        println!("{}", json!({ "cleared": cleared, "rearmed": rearmed }));
+    } else {
+        println!("cleared {cleared} records, re-armed {rearmed} previews");
+    }
+    0
+}

@@ -58,6 +58,12 @@ pub fn run(argv: &[String]) -> i32 {
         }
         Ok(Command::List { json }) => page::list(&cmd, json),
         Ok(Command::Stop { target, json }) => page::stop(&cmd, &target, json),
+        Ok(Command::Logs {
+            target,
+            lines,
+            json,
+        }) => page::logs(&cmd, target.as_deref(), lines, json),
+        Ok(Command::Truncate { target, json }) => page::truncate(&cmd, target.as_deref(), json),
         Ok(Command::Serve(opts)) => serve(&cmd, &opts),
     }
 }
@@ -123,6 +129,10 @@ fn serve(cmd: &str, opts: &Serve) -> i32 {
         entry: opts.entry.clone(),
         local: opts.local,
         foreground: opts.foreground,
+        json: opts.json,
+        bridge: opts.bridge,
+        max_tabs: opts.max_tabs,
+        quiet: opts.quiet,
     };
     if opts.foreground {
         hold::foreground(cmd, &spec, opts)

@@ -64,6 +64,7 @@ fn row(preview: &Value, record: Option<&Record>) -> Value {
         "mode": mode_of(preview),
         "url": record.and_then(|r| r.url.clone()).or_else(|| text("url")),
         "localUrl": record.and_then(|r| r.local_url.clone()),
+        "cdpUrl": record.and_then(|r| r.cdp_url.clone()),
         "root": record.and_then(|r| r.root.clone()),
         "createdAt": text("createdAt"),
         "expiresAt": text("expiresAt"),

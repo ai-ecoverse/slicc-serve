@@ -2,8 +2,11 @@ use crate::MAX_TTL_MS;
 
 pub const USAGE: &str = "usage: scserve [--entry FILE] [--ttl DURATION] [--local] [--foreground] [--open] [--json] DIRECTORY
        scserve --port PORT [--entry PATH] [--local] [--foreground] [--open] [--json]
+       scserve --bridge [--max-tabs N] [--quiet] [other options] DIRECTORY | --port PORT
        scserve --list [--json]
        scserve --stop TOKEN|URL|PORT [--json]
+       scserve --logs [TOKEN|URL] [--lines N] [--json]
+       scserve --truncate [TOKEN|URL] [--json]
        scserve --version | --upgrade | --help
 ";
 
@@ -20,6 +23,14 @@ capability URL on sliccy.now through the SLICC tray hub.
   --foreground     stay attached; Ctrl-C stops the preview
   --open           open the URL with the platform's opener
   --json           print the result as JSON
+  --bridge         let a local CDP client drive the visitors' tabs, and pass
+                   their window.slicc.emit() calls on
+  --no-bridge      no bridge (the default)
+  --max-tabs N     with --bridge: at most N bridged tabs (1 to 100, default 20)
+  --quiet          with --bridge: don't announce the first visitor
+  --logs [TOKEN]   print the bridge's connects, disconnects and emits
+  --lines N        with --logs: only the newest N records
+  --truncate [TOKEN]  clear those records and re-arm the first-visit announcement
   --list           list the previews this machine published
   --stop TARGET    stop a preview, by token, URL or port
   --version        print the version
@@ -40,6 +51,9 @@ pub struct Serve {
     pub foreground: bool,
     pub open: bool,
     pub json: bool,
+    pub bridge: bool,
+    pub max_tabs: Option<u32>,
+    pub quiet: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,29 +62,37 @@ pub enum Command {
     Version,
     Upgrade,
     Relay,
-    List { json: bool },
-    Stop { target: String, json: bool },
+    List {
+        json: bool,
+    },
+    Stop {
+        target: String,
+        json: bool,
+    },
+    Logs {
+        target: Option<String>,
+        lines: Option<usize>,
+        json: bool,
+    },
+    Truncate {
+        target: Option<String>,
+        json: bool,
+    },
     Serve(Serve),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Usage(pub String);
 
-const LATER: &[&str] = &[
-    "--bridge",
-    "--no-bridge",
-    "--max-tabs",
-    "--quiet",
-    "--logs",
-    "--truncate",
-    "--lines",
-];
-
 #[derive(Default)]
 struct State {
     serve: Serve,
     list: bool,
     stop: Option<String>,
+    logs: Option<Option<String>>,
+    truncate: Option<Option<String>>,
+    lines: Option<usize>,
+    no_bridge: bool,
     version: bool,
     upgrade: bool,
     count: usize,
@@ -134,11 +156,34 @@ pub fn parse(args: &[String]) -> Result<Command, Usage> {
             "--ttl" => state.serve.ttl_ms = Some(ttl(&value("a duration")?)?),
             "--port" => state.serve.port = Some(port(&value("a port")?)?),
             "--stop" => state.stop = Some(value("a token or URL")?),
+            "--max-tabs" => state.serve.max_tabs = Some(max_tabs(&value("a number")?)?),
+            "--lines" => state.lines = Some(lines(&value("a number")?)?),
+            "--logs" | "--truncate" => {
+                let target = match (&inline, args.get(i)) {
+                    (Some(v), _) if v.is_empty() => {
+                        return Err(Usage(format!("{name} needs a token or URL after =")))
+                    }
+                    (Some(v), _) => Some(v.clone()),
+                    (None, Some(next)) if options && !next.starts_with('-') && !next.is_empty() => {
+                        i += 1;
+                        Some(next.clone())
+                    }
+                    _ => None,
+                };
+                if name == "--logs" {
+                    state.logs = Some(target);
+                } else {
+                    state.truncate = Some(target);
+                }
+            }
             _ if inline.is_some() => return Err(Usage(format!("{name} takes no value"))),
             "--local" => state.serve.local = true,
             "--foreground" => state.serve.foreground = true,
             "--open" => state.serve.open = true,
             "--json" => state.serve.json = true,
+            "--bridge" => state.serve.bridge = true,
+            "--no-bridge" => state.no_bridge = true,
+            "--quiet" => state.serve.quiet = true,
             "--list" => state.list = true,
             "--version" => state.version = true,
             "--upgrade" => state.upgrade = true,
@@ -146,9 +191,6 @@ pub fn parse(args: &[String]) -> Result<Command, Usage> {
                 return Err(Usage(
                     "--project is obsolete: give the directory to serve itself".into(),
                 ))
-            }
-            _ if LATER.contains(&name) => {
-                return Err(Usage(format!("{name} is not supported yet")));
             }
             _ => return Err(Usage(format!("unknown option: {name}"))),
         }
@@ -179,6 +221,34 @@ fn finish(state: State) -> Result<Command, Usage> {
             Err(Usage("--list takes only --json".into()))
         };
     }
+    if let Some(target) = state.logs {
+        return if extra == 1 + usize::from(state.lines.is_some()) {
+            Ok(Command::Logs {
+                target,
+                lines: state.lines,
+                json: serve.json,
+            })
+        } else {
+            Err(Usage(
+                "--logs takes only a token or URL, --lines and --json".into(),
+            ))
+        };
+    }
+    if state.lines.is_some() {
+        return Err(Usage("--lines goes with --logs".into()));
+    }
+    if let Some(target) = state.truncate {
+        return if extra == 1 {
+            Ok(Command::Truncate {
+                target,
+                json: serve.json,
+            })
+        } else {
+            Err(Usage(
+                "--truncate takes only a token or URL and --json".into(),
+            ))
+        };
+    }
     if let Some(target) = state.stop {
         return if extra == 1 {
             Ok(Command::Stop {
@@ -194,7 +264,26 @@ fn finish(state: State) -> Result<Command, Usage> {
         (Some(_), Some(_)) => return Err(Usage("give a directory or --port, not both".into())),
         _ => {}
     }
+    if serve.bridge && state.no_bridge {
+        return Err(Usage("give --bridge or --no-bridge, not both".into()));
+    }
+    if !serve.bridge {
+        if serve.max_tabs.is_some() {
+            return Err(Usage("--max-tabs goes with --bridge".into()));
+        }
+        if serve.quiet {
+            return Err(Usage("--quiet goes with --bridge".into()));
+        }
+    }
+    if serve.bridge && serve.local {
+        return Err(Usage("--bridge publishes; it can't be --local".into()));
+    }
     if serve.ttl_ms.is_some() {
+        if serve.bridge {
+            return Err(Usage(
+                "--ttl snapshots have no visitor sockets, so there is no --bridge".into(),
+            ));
+        }
         if serve.port.is_some() {
             return Err(Usage(
                 "--ttl snapshots a directory; it can't snapshot a server".into(),
@@ -254,5 +343,21 @@ pub fn port(raw: &str) -> Result<u16, Usage> {
         _ => Err(Usage(format!(
             "--port must be a port from 1 to 65535: {raw}"
         ))),
+    }
+}
+
+pub fn max_tabs(raw: &str) -> Result<u32, Usage> {
+    match raw.parse::<u32>() {
+        Ok(n) if (1..=100).contains(&n) && raw.bytes().all(|b| b.is_ascii_digit()) => Ok(n),
+        _ => Err(Usage(format!(
+            "--max-tabs must be a number from 1 to 100: {raw}"
+        ))),
+    }
+}
+
+pub fn lines(raw: &str) -> Result<usize, Usage> {
+    match raw.parse::<usize>() {
+        Ok(n) if n > 0 && raw.bytes().all(|b| b.is_ascii_digit()) => Ok(n),
+        _ => Err(Usage(format!("--lines must be a positive number: {raw}"))),
     }
 }

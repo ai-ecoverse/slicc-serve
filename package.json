@@ -37,7 +37,7 @@
     "test": "cargo build --locked -p serve && node --test --test-timeout=180000 test/integration/*.test.mjs",
     "test:ci": "npm run build:wasm && npm test",
     "test:windows": "cargo build --locked -p serve && node --test --test-concurrency=1 --test-timeout=300000 test/integration/*.test.mjs",
-    "test:unit": "mkdir -p coverage/unit && RUSTFLAGS='--cfg serve_unit' cargo llvm-cov --workspace --lcov --output-path coverage/unit/lcov.info --ignore-filename-regex '(crates/serve/src/|test/unit/|daemon\\.rs|detach\\.rs|cli\\.rs|client\\.rs|upgrade\\.rs|open\\.rs|ws\\.rs|list\\.rs|ttl\\.rs|records\\.rs|fsx\\.rs|tray\\.rs)'",
+    "test:unit": "mkdir -p coverage/unit && RUSTFLAGS='--cfg serve_unit' cargo llvm-cov --workspace --lcov --output-path coverage/unit/lcov.info --ignore-filename-regex '(crates/serve/src/|test/unit/|daemon\\.rs|bridge\\.rs|cdp\\.rs|detach\\.rs|cli\\.rs|client\\.rs|upgrade\\.rs|open\\.rs|ws\\.rs|list\\.rs|ttl\\.rs|records\\.rs|fsx\\.rs|tray\\.rs)'",
     "trust": "npx fledgling sync -y --skip-publish",
     "trust:dry": "npx fledgling sync --dry-run -y --skip-publish",
     "release": "semantic-release"

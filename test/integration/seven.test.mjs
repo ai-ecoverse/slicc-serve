@@ -42,6 +42,9 @@ function publish(request) {
       if (reason) controller.enqueue(encoder.encode(`${JSON.stringify({ stopped: reason })}\n`));
       controller.close();
     },
+    push(value) {
+      controller.enqueue(encoder.encode(`${JSON.stringify(value)}\n`));
+    },
   };
   const gone = (why) => {
     if (preview.ended) return;
@@ -53,17 +56,42 @@ function publish(request) {
   return new ReadableStream({
     start(c) {
       controller = c;
-      c.enqueue(encoder.encode(`${JSON.stringify({ url, previewToken: token, trayId: 't1' })}\n`));
+      const webhook =
+        request.options.bridge && !page.noBridge ? { webhook: 'serve-0123456789abcdef' } : {};
+      c.enqueue(
+        encoder.encode(
+          `${JSON.stringify({ url, previewToken: token, trayId: 't1', ...webhook })}\n`
+        )
+      );
     },
     cancel: (reason) => gone(String(reason)),
   });
 }
 
 const requests = {
-  kinds: { 'serve.publish': {}, 'serve.list': {}, 'serve.stop': {}, 'open.url': {} },
+  kinds: {
+    'serve.publish': {},
+    'serve.list': {},
+    'serve.stop': {},
+    'serve.logs': {},
+    'serve.truncate': {},
+    'open.url': {},
+  },
   async handle(request) {
     page.calls.push({ kind: request.kind, options: request.options });
     if (page.fail) throw page.fail;
+    if (request.kind === 'serve.logs') {
+      const token = request.options.previewToken;
+      return page.records
+        .filter((r) => !token || r.previewToken === token)
+        .map((r) => `${JSON.stringify(r)}\n`)
+        .join('');
+    }
+    if (request.kind === 'serve.truncate') {
+      const cleared = page.records.length;
+      page.records = [];
+      return `${JSON.stringify({ cleared, rearmed: page.previews.size })}\n`;
+    }
     if (request.kind === 'serve.publish') {
       if (page.answer !== undefined) return page.answer;
       return publish(request);
@@ -108,6 +136,8 @@ beforeEach(() => {
   page.calls = [];
   page.fail = undefined;
   page.answer = undefined;
+  page.noBridge = false;
+  page.records = [];
 });
 
 const run = (argv, opts) => os.run(argv, opts);
@@ -479,6 +509,92 @@ describe('serve in a kernel with a page', { skip }, () => {
       stdout: '',
       stderr: 'serve: no preview matches nothing\n',
     });
+  });
+});
+
+describe('serve --bridge in seven', { skip }, () => {
+  beforeEach(stopAll);
+
+  it('asks the page for the bridge and names the CDP targets', async () => {
+    const res = await run(['serve', '--bridge', '--max-tabs', '4', '--quiet', '/w/site']);
+    assert.equal(res.status, 0, res.stderr);
+    const [preview] = page.previews.values();
+    assert.equal(page.calls[0].options.bridge, true);
+    assert.equal(page.calls[0].options.maxTabs, 4);
+    assert.equal(page.calls[0].options.quiet, true);
+    assert.match(
+      res.stderr,
+      new RegExp(
+        `\\nserve: its visitor tabs are CDP targets preview:${preview.token.replace('.', '\\.')}:\\* on ws://127\\.0\\.0\\.1:9222/devtools/browser/`
+      )
+    );
+    const [record] = await records();
+    assert.equal(record.bridge, true);
+    assert.match(record.cdpUrl, /^ws:\/\/127\.0\.0\.1:9222\//);
+  });
+
+  it('stops a preview the page published without the bridge', async () => {
+    page.noBridge = true;
+    const res = await run(['serve', '--bridge', '/w/site']);
+    assert.equal(res.status, 1);
+    assert.equal(
+      res.stderr,
+      'serve: this seven publishes without the bridge, so serve stopped the preview again; --bridge needs a newer slicc-bios\n'
+    );
+    await eventually(() => page.previews.size === 0, 20_000);
+    assert.deepEqual(await records(), []);
+  });
+
+  it('prints the events of a --foreground --bridge serve, and asks the page for --logs and --truncate', async () => {
+    const running = run(['serve', '--bridge', '--foreground', '--json', '/w/site']);
+    await eventually(() => page.previews.size === 1, 20_000);
+    const [preview] = page.previews.values();
+    const connected = {
+      event: 'connected',
+      at: '2026-11-21T00:00:00.000Z',
+      previewToken: preview.token,
+      connId: 'c1',
+      announced: true,
+      origin: 'https://a.example',
+      userAgent: 'UA',
+    };
+    const emit = {
+      event: 'emit',
+      previewToken: preview.token,
+      connId: 'c1',
+      name: 'hi',
+      detail: '{"a":1}',
+    };
+    preview.push(connected);
+    preview.push(emit);
+    page.records = [connected, emit];
+    const logs = await run(['serve', '--logs', preview.token, '--lines', '1']);
+    assert.equal(logs.status, 0, logs.stderr);
+    assert.match(
+      logs.stdout,
+      /^Preview lifecycle records \(oldest to newest\):\n.*emit\s+-\s+preview=.* conn=c1 name=hi detail=\{"a":1\}\n$/
+    );
+    assert.deepEqual(page.calls.at(-1), {
+      kind: 'serve.logs',
+      options: { previewToken: preview.token },
+    });
+    assert.deepEqual(await run(['serve', '--truncate', '--json']), {
+      status: 0,
+      stdout: '{"cleared":2,"rearmed":1}\n',
+      stderr: '',
+    });
+    assert.equal((await run(['serve', '--logs'])).stdout.startsWith('no lifecycle records'), true);
+    preview.end('stopped in seven');
+    const res = await running;
+    assert.equal(res.status, 0, res.stderr);
+    const lines = res.stdout
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l));
+    assert.deepEqual(lines.slice(1), [connected, emit]);
+    assert.match(res.stderr, /serve: first visitor on .*: https:\/\/a\.example \(UA\)\n/);
+    assert.match(res.stderr, /serve: connected c1 https:\/\/a\.example UA\n/);
+    assert.match(res.stderr, /serve: emit c1 hi \{"a":1\}\n/);
   });
 });
 

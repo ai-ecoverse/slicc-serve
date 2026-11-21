@@ -22,6 +22,14 @@ pub struct Spec {
     pub entry: Option<String>,
     pub local: bool,
     pub foreground: bool,
+    #[serde(default)]
+    pub json: bool,
+    #[serde(default)]
+    pub bridge: bool,
+    #[serde(default)]
+    pub max_tabs: Option<u32>,
+    #[serde(default)]
+    pub quiet: bool,
 }
 
 struct Held {
@@ -98,6 +106,13 @@ fn start(cmd: &str, spec: &Spec, store: &Store) -> Result<Held, Failure> {
         if let Some(entry) = &entry {
             request["entry"] = json!(entry);
         }
+        if spec.bridge {
+            request["bridge"] = json!(true);
+            request["maxTabs"] = json!(spec.max_tabs.unwrap_or(20));
+            if spec.quiet {
+                request["quiet"] = json!(true);
+            }
+        }
         let (held, line) = embedder::publish(&request).map_err(|e| Failure::page(cmd, &e))?;
         let answer: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
         if line.trim().is_empty() {
@@ -117,6 +132,17 @@ fn start(cmd: &str, spec: &Spec, store: &Store) -> Result<Held, Failure> {
         record.url = Some(public_url(&url, entry.is_some()));
         record.preview_token = Some(token);
         record.tray_id = text("trayId");
+        if spec.bridge {
+            if text("webhook").is_none() {
+                return Err(Failure::plain(format!(
+                    "{cmd}: this seven publishes without the bridge, so {cmd} stopped the preview again; --bridge needs a newer slicc-bios"
+                )));
+            }
+            record.bridge = true;
+            record.cdp_url = std::env::var("SLICC_CDP_URL")
+                .ok()
+                .filter(|u| !u.is_empty());
+        }
         reader = Some(held);
     }
     store
@@ -129,7 +155,7 @@ fn start(cmd: &str, spec: &Spec, store: &Store) -> Result<Held, Failure> {
     })
 }
 
-fn wait(cmd: &str, held: Held, store: &Store) -> i32 {
+fn wait(cmd: &str, held: Held, store: &Store, json: bool) -> i32 {
     let Held {
         record,
         reader,
@@ -157,6 +183,15 @@ fn wait(cmd: &str, held: Held, store: &Store) -> i32 {
                 if let Some(r) = value.get("stopped").and_then(Value::as_str) {
                     reason = Some(r.to_string());
                 }
+                if record.foreground && value.get("event").and_then(Value::as_str).is_some() {
+                    for l in serve_core::table::event_line(cmd, &value, record.shown_url()) {
+                        eprintln!("{l}");
+                    }
+                    if json {
+                        println!("{value}");
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
+                }
             }
         }
     }
@@ -176,7 +211,7 @@ pub fn foreground(cmd: &str, spec: &Spec, opts: &Serve) -> i32 {
     match start(cmd, spec, &store) {
         Ok(held) => {
             out::done(cmd, &held.record, opts);
-            wait(cmd, held, &store)
+            wait(cmd, held, &store, spec.json)
         }
         Err(f) => out::fail(&f, opts.json),
     }
@@ -210,7 +245,7 @@ pub fn background(cmd: &str, raw: &str) -> i32 {
                 held.record.shown_url(),
                 held.record.port.unwrap_or(0)
             );
-            wait(cmd, held, &store)
+            wait(cmd, held, &store, spec.json)
         }
         Err(f) => {
             report(&f.to_json());

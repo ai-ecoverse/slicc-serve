@@ -28,6 +28,10 @@ pub struct Record {
     pub pid: Option<u32>,
     #[serde(default)]
     pub foreground: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bridge: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_url: Option<String>,
 }
 
 impl Record {

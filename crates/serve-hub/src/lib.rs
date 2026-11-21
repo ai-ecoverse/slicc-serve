@@ -1,5 +1,7 @@
 #![cfg(not(target_os = "wasi"))]
 
+pub mod bridge;
+pub mod cdp;
 pub mod cli;
 pub mod client;
 pub mod daemon;
