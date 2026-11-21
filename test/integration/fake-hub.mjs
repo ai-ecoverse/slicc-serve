@@ -157,6 +157,94 @@ export async function fakeHub() {
     return null;
   }
 
+  function previewOfHost(host) {
+    const match = (host ?? '').match(PREVIEW_HOST);
+    if (!match) return null;
+    const compact = match[1].toLowerCase();
+    const trayId = [
+      compact.slice(0, 8),
+      compact.slice(8, 12),
+      compact.slice(12, 16),
+      compact.slice(16, 20),
+      compact.slice(20),
+    ].join('-');
+    return findPreview(`${trayId}.${match[2].toLowerCase()}`);
+  }
+
+  function bridgeTab(req, sock, refuse) {
+    const found = previewOfHost(req.headers.host);
+    if (!found) return refuse(404, { error: 'Preview not found' });
+    const { tray, preview } = found;
+    if (!preview.bridge)
+      return refuse(403, { error: 'Bridge not enabled', code: 'BRIDGE_DISABLED' });
+    if (preview.tabs.size >= preview.maxTabs)
+      return refuse(429, { error: 'Too many bridged tabs', code: 'BRIDGE_CAP' });
+    const key = req.headers['sec-websocket-key'];
+    const accept = createHash('sha1')
+      .update(key + GUID)
+      .digest('base64');
+    sock.write(
+      `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`
+    );
+    const connId = randomUUID();
+    const meta = {
+      connId,
+      previewToken: preview.previewToken,
+      origin: req.headers.origin ?? '',
+      userAgent: req.headers['user-agent'] ?? '',
+      connectedAt: new Date().toISOString(),
+    };
+    let gone = false;
+    const forget = () => {
+      if (gone) return;
+      gone = true;
+      preview.tabs.delete(connId);
+      tray.socket?.send({ type: 'bridge.disconnected', connId });
+    };
+    const ws = socketFor(
+      sock,
+      (text) => {
+        let frame;
+        try {
+          frame = JSON.parse(text);
+        } catch {
+          return;
+        }
+        if (frame.t === 'cdp.res') {
+          tray.socket?.send({
+            type: 'bridge.cdp.response',
+            connId,
+            id: frame.id,
+            result: frame.result,
+            error: frame.error,
+          });
+        } else if (frame.t === 'emit' && text.length <= 16 * 1024 && preview.webhookId) {
+          tray.socket?.send({
+            type: 'webhook.event',
+            webhookId: preview.webhookId,
+            headers: {
+              'x-slicc-preview-conn': connId,
+              'x-slicc-preview-token': preview.previewToken,
+            },
+            body: { name: frame.name, detail: frame.detail },
+            timestamp: new Date().toISOString(),
+          });
+        }
+      },
+      forget
+    );
+    preview.tabs.set(connId, {
+      meta,
+      ws,
+      close() {
+        forget();
+        ws.close();
+      },
+    });
+    ws.send({ t: 'welcome', connId });
+    tray.socket?.send({ type: 'bridge.connected', ...meta });
+  }
+
   function findPreview(token) {
     for (const tray of trays.values()) {
       const p = tray.previews.get(token);
@@ -289,6 +377,13 @@ export async function fakeHub() {
         expiresAt: persistent ? new Date(Date.now() + body.ttlMs).toISOString() : undefined,
         uploadToken: persistent ? `${tray.trayId}.${hex(18)}` : undefined,
         files: new Map(),
+        bridge: persistent ? false : body.bridge === true,
+        maxTabs: body.maxTabs ?? 20,
+        webhookId: body.webhookId,
+        quiet: body.quiet ?? false,
+        announced: false,
+        mint: body,
+        tabs: new Map(),
       };
       tray.previews.set(previewToken, preview);
       return json(res, 200, { previewToken, url: preview.url, uploadToken: preview.uploadToken });
@@ -296,7 +391,9 @@ export async function fakeHub() {
     if (rest === 'preview/stop' && req.method === 'POST') {
       const body = JSON.parse((await readBody(req)).toString() || '{}');
       if (!tray.previews.has(body.previewToken)) return json(res, 200, { revoked: false });
+      const gone = tray.previews.get(body.previewToken);
       tray.previews.delete(body.previewToken);
+      for (const tab of gone.tabs.values()) tab.close('preview revoked');
       tray.socket?.send({ type: 'preview.revoked', previewToken: body.previewToken });
       return json(res, 200, { revoked: true });
     }
@@ -468,6 +565,7 @@ export async function fakeHub() {
       sock.end(`${lines.join('\r\n')}\r\n\r\n${text}`);
     };
     if (rule) return refuse(rule.status, rule.body, rule.headers);
+    if (url.pathname === '/__slicc/bridge') return bridgeTab(req, sock, refuse);
     const m = url.pathname.match(/^\/controller\/([^/]+)$/);
     const tray = m && trayByController(m[1]);
     if (!tray)
@@ -506,6 +604,34 @@ export async function fakeHub() {
         tray.messages.push(message.type);
         if (message.type === 'ping') ws.send({ type: 'pong', trayId: tray.trayId });
         if (message.type === 'preview.response') tray.pending.get(message.reqId)?.(message);
+        if (message.type === 'preview.state.update') {
+          const p = tray.previews.get(message.previewToken);
+          if (p) p.announced = message.announced;
+        }
+        if (message.type === 'bridge.cdp.request') {
+          const tab = [...tray.previews.values()]
+            .map((p) => p.tabs.get(message.connId))
+            .find(Boolean);
+          if (!tab) {
+            ws.send({
+              type: 'bridge.cdp.response',
+              connId: message.connId,
+              id: message.id,
+              error: { code: -32000, message: 'Preview bridge connection is gone' },
+            });
+          } else {
+            tab.ws.send({
+              t: 'cdp.req',
+              id: message.id,
+              method: message.method,
+              params: message.params,
+              sessionId: message.sessionId,
+            });
+          }
+        }
+        if (message.type === 'bridge.close') {
+          for (const p of tray.previews.values()) p.tabs.get(message.connId)?.close();
+        }
       },
       () => {
         if (tray.socket === ws) tray.socket = null;
@@ -518,6 +644,17 @@ export async function fakeHub() {
       trayId: tray.trayId,
       controllerId: tray.leader.controllerId,
     });
+    for (const p of tray.previews.values()) {
+      if (p.mode !== 'live') continue;
+      ws.send({
+        type: 'preview.state',
+        previewToken: p.previewToken,
+        quiet: p.quiet,
+        announced: p.announced,
+      });
+      for (const tab of p.tabs.values())
+        ws.send({ type: 'bridge.connected', ...tab.meta, replay: true });
+    }
   });
 
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -547,6 +684,68 @@ export async function fakeHub() {
         (r) => r.method === method && (path instanceof RegExp ? path.test(r.path) : r.path === path)
       ).length;
     },
+    tab(
+      previewUrl,
+      { origin = 'https://visitor.example', userAgent = 'Visitor/1.0', answer } = {}
+    ) {
+      const u = new URL(previewUrl);
+      return new Promise((resolve, reject) => {
+        const r = request({
+          host: '127.0.0.1',
+          port,
+          path: '/__slicc/bridge',
+          headers: {
+            host: u.host,
+            origin,
+            'user-agent': userAgent,
+            connection: 'Upgrade',
+            upgrade: 'websocket',
+            'sec-websocket-version': '13',
+            'sec-websocket-key': randomBytes(16).toString('base64'),
+          },
+        });
+        r.on('response', (res) => {
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () =>
+            resolve({ refused: res.statusCode, body: Buffer.concat(chunks).toString() })
+          );
+        });
+        r.on('upgrade', (_res, sock, head) => {
+          if (head?.length) sock.unshift(head);
+          const tab = { requests: [], closed: false, connId: null };
+          let ready;
+          const welcomed = new Promise((r2) => {
+            ready = r2;
+          });
+          const ws = socketFor(
+            sock,
+            async (text) => {
+              const frame = JSON.parse(text);
+              if (frame.t === 'welcome') {
+                tab.connId = frame.connId;
+                ready();
+                return;
+              }
+              if (frame.t !== 'cdp.req') return;
+              tab.requests.push(frame);
+              const reply = answer ? await answer(frame) : { result: {} };
+              if (reply === null) return;
+              ws.send({ t: 'cdp.res', id: frame.id, ...reply });
+            },
+            () => {
+              tab.closed = true;
+            }
+          );
+          tab.emit = (name, detail) => ws.send({ t: 'emit', name, detail });
+          tab.send = (value) => ws.send(value);
+          tab.close = () => ws.close();
+          welcomed.then(() => resolve(tab), reject);
+        });
+        r.on('error', reject);
+        r.end();
+      });
+    },
     visit(previewUrl, headers = {}) {
       const u = new URL(previewUrl);
       return new Promise((resolve, reject) => {
@@ -570,7 +769,12 @@ export async function fakeHub() {
       });
     },
     close() {
-      for (const tray of trays.values()) tray.socket?.close();
+      for (const tray of trays.values()) {
+        for (const p of tray.previews.values())
+          for (const tab of p.tabs?.values() ?? []) tab.close();
+        tray.socket?.close();
+      }
+      server.closeAllConnections?.();
       return new Promise((resolve) => server.close(resolve));
     },
   };

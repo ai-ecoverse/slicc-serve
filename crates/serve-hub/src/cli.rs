@@ -46,6 +46,14 @@ pub fn run(argv: &[String], out: Out, err: Out) -> i32 {
         Command::Stop { target, json } => with_hub(err, |hub, err| {
             stop_cmd(hub, &dirs, &target, json, out, err)
         }),
+        Command::Logs {
+            target,
+            lines,
+            json,
+        } => logs_cmd(&dirs, target.as_deref(), lines, json, out, err),
+        Command::Truncate { target, json } => {
+            truncate_cmd(&dirs, target.as_deref(), json, out, err)
+        }
         Command::Serve(opts) => serve(&opts, &dirs, out, err),
     }
 }
@@ -141,6 +149,92 @@ fn stop_cmd(hub: &Hub, dirs: &Dirs, target: &str, json: bool, out: Out, err: Out
             f.exit.code()
         }
     }
+}
+
+fn token_of(dirs: &Dirs, target: Option<&str>, err: Out) -> Result<Option<String>, i32> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let records = Records::new(&dirs.state);
+    let found = match records.find(target) {
+        serve_core::record::Found::One(r) => r.preview_token,
+        _ => None,
+    };
+    match found
+        .or_else(|| serve_core::token::from_url(target))
+        .or_else(|| serve_core::token::is_token(target).then(|| target.to_string()))
+    {
+        Some(t) => Ok(Some(t)),
+        None => {
+            let _ = writeln!(err, "{NAME}: no preview matches {target}");
+            Err(Exit::Failure.code())
+        }
+    }
+}
+
+fn relay_op(dirs: &Dirs, request: Value) -> Option<Value> {
+    let relay = client::find(dirs)?;
+    client::send(&relay, request).ok().map(|x| x.reply)
+}
+
+fn logs_cmd(
+    dirs: &Dirs,
+    target: Option<&str>,
+    lines: Option<usize>,
+    json: bool,
+    out: Out,
+    err: Out,
+) -> i32 {
+    let token = match token_of(dirs, target, err) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let reply = relay_op(dirs, json!({ "op": "logs", "previewToken": token }));
+    let mut records: Vec<Value> = reply
+        .and_then(|r| r.get("records").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    if let Some(n) = lines {
+        let skip = records.len().saturating_sub(n);
+        records.drain(..skip);
+    }
+    if json {
+        let _ = writeln!(out, "{}", Value::Array(records));
+    } else if records.is_empty() {
+        let _ = writeln!(
+            out,
+            "no lifecycle records (the relay keeps them in memory, so they are gone when it restarts)"
+        );
+    } else {
+        let _ = writeln!(out, "Preview lifecycle records (oldest to newest):");
+        for r in &records {
+            let _ = writeln!(out, "{}", serve_core::table::log_line(r));
+        }
+    }
+    0
+}
+
+fn truncate_cmd(dirs: &Dirs, target: Option<&str>, json: bool, out: Out, err: Out) -> i32 {
+    let token = match token_of(dirs, target, err) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let reply = relay_op(dirs, json!({ "op": "truncate", "previewToken": token }));
+    let count = |k: &str| {
+        reply
+            .as_ref()
+            .and_then(|r| r.get(k).and_then(Value::as_u64))
+            .unwrap_or(0)
+    };
+    let (cleared, rearmed) = (count("cleared"), count("rearmed"));
+    if json {
+        let _ = writeln!(out, "{}", json!({ "cleared": cleared, "rearmed": rearmed }));
+    } else {
+        let _ = writeln!(
+            out,
+            "cleared {cleared} records, re-armed {rearmed} previews"
+        );
+    }
+    0
 }
 
 fn plain(line: String) -> Failure {
@@ -262,9 +356,15 @@ fn done(record: &Record, opts: &Serve, out: Out, err: Out, extra: Option<(usize,
                     .unwrap_or_default();
                 let _ = writeln!(err, "{NAME}: {what} is public at {url}{local}");
                 let _ = writeln!(err, "{NAME}: stop it with: {NAME} --stop {token}");
+                if let Some(cdp) = record.cdp_url.as_deref() {
+                    let _ = writeln!(err, "{NAME}: its visitor tabs are CDP targets at {cdp}");
+                }
             }
             (_, Some(_)) => {
                 let _ = writeln!(err, "{NAME}: {what} is public at {url}; Ctrl-C stops it");
+                if let Some(cdp) = record.cdp_url.as_deref() {
+                    let _ = writeln!(err, "{NAME}: its visitor tabs are CDP targets at {cdp}");
+                }
             }
             (_, None) if record.root.is_some() && !opts.foreground => {
                 let _ = writeln!(
@@ -372,6 +472,9 @@ fn publish(hub: &Hub, dirs: &Dirs, abs: Option<&Path>, opts: &Serve, out: Out, e
         "local": opts.local,
         "hold": opts.foreground,
         "hub": hub.origin(),
+        "bridge": opts.bridge,
+        "maxTabs": opts.max_tabs,
+        "quiet": opts.quiet,
     });
     let mut exchange = None;
     let mut last = String::new();
@@ -432,6 +535,15 @@ fn publish(hub: &Hub, dirs: &Dirs, abs: Option<&Path>, opts: &Serve, out: Out, e
         };
         if let Some(log) = message.get("log").and_then(Value::as_str) {
             let _ = writeln!(err, "{NAME}: {log}");
+        }
+        if let Some(ev) = message.get("event") {
+            for l in serve_core::table::event_line(NAME, ev, record.shown_url()) {
+                let _ = writeln!(err, "{l}");
+            }
+            if opts.json {
+                let _ = writeln!(out, "{ev}");
+                let _ = out.flush();
+            }
         }
         if let Some(reason) = message.get("stopped").and_then(Value::as_str) {
             let _ = writeln!(err, "{NAME}: stopped: {reason}");

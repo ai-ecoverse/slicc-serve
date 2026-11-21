@@ -1,3 +1,5 @@
+use crate::bridge::Bridge;
+use crate::cdp::{self, Endpoint};
 use crate::fsx;
 use crate::hub::{Hub, HubError, Payload};
 use crate::records::Records;
@@ -22,6 +24,7 @@ use tungstenite::Message;
 
 pub const IDLE: Duration = Duration::from_secs(5);
 const PING: Duration = Duration::from_secs(30);
+const RELINK: Duration = Duration::from_secs(3);
 const RECONNECT: [u64; 5] = [1, 2, 5, 10, 30];
 
 pub struct Failure {
@@ -89,6 +92,9 @@ pub struct Daemon {
     busy: AtomicUsize,
     activity: Mutex<Instant>,
     agent: ureq::Agent,
+    bridge: Arc<Bridge>,
+    endpoint: Mutex<Option<Endpoint>>,
+    info: Mutex<Value>,
     me: Weak<Daemon>,
 }
 
@@ -139,6 +145,9 @@ pub fn run(dirs: Dirs) -> i32 {
         busy: AtomicUsize::new(0),
         activity: Mutex::new(Instant::now()),
         agent: relay::agent(),
+        bridge: Arc::new(Bridge::new(serve_core::version())),
+        endpoint: Mutex::new(None),
+        info: Mutex::new(Value::Null),
         hub,
     });
     daemon.sweep_records();
@@ -149,6 +158,7 @@ pub fn run(dirs: Dirs) -> i32 {
         "version": serve_core::version(),
         "hub": daemon.hub.origin(),
     });
+    *daemon.info.lock().unwrap() = info.clone();
     if fsx::write_json(&dirs.state.join("relay.json"), &info).is_err() {
         return 1;
     }
@@ -225,6 +235,21 @@ impl Daemon {
                     );
                 }
                 Some("publish") => self.clone().publish_op(&request, stream, reader),
+                Some("logs") => {
+                    let token = request.get("previewToken").and_then(Value::as_str);
+                    line(
+                        &mut stream,
+                        &json!({ "ok": true, "records": self.bridge.logs(token) }),
+                    );
+                }
+                Some("truncate") => {
+                    let token = request.get("previewToken").and_then(Value::as_str);
+                    let (cleared, rearmed) = self.bridge.truncate(token);
+                    line(
+                        &mut stream,
+                        &json!({ "ok": true, "cleared": cleared, "rearmed": rearmed }),
+                    );
+                }
                 Some("stop") => {
                     let id = request.get("id").and_then(Value::as_str).unwrap_or("");
                     let found = self.stop(id, "stopped with scserve --stop", true);
@@ -307,6 +332,22 @@ impl Daemon {
         Ok((port, ServerHandle { stop, port }))
     }
 
+    fn cdp_url(&self) -> Result<String, Failure> {
+        let mut slot = self.endpoint.lock().unwrap();
+        if let Some(e) = slot.as_ref() {
+            return Ok(e.url());
+        }
+        let endpoint = cdp::start(self.bridge.clone(), fsx::random_hex(16))
+            .map_err(|e| Failure::plain(format!("{NAME}: can't start the CDP endpoint: {e}")))?;
+        let url = endpoint.url();
+        let mut info = self.info.lock().unwrap();
+        info["cdpPort"] = json!(endpoint.port);
+        info["cdpSecret"] = json!(endpoint.secret);
+        let _ = fsx::write_json(&self.state.join("relay.json"), &*info);
+        *slot = Some(endpoint);
+        Ok(url)
+    }
+
     fn publish(&self, request: &Value, hold: bool) -> Result<Record, Failure> {
         let text = |k: &str| request.get(k).and_then(Value::as_str).map(str::to_string);
         let local = request
@@ -315,6 +356,17 @@ impl Daemon {
             .unwrap_or(false);
         let entry = text("entry");
         let explicit = entry.is_some();
+        let bridged = !local
+            && request
+                .get("bridge")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        let quiet = request
+            .get("quiet")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let max_tabs = request.get("maxTabs").and_then(Value::as_u64).unwrap_or(20);
+        let cdp_url = if bridged { Some(self.cdp_url()?) } else { None };
         let id = fsx::random_hex(8);
         let dir = text("dir");
         let (port, server) = match &dir {
@@ -344,6 +396,8 @@ impl Daemon {
             created_at: time::iso(time::now_ms()),
             pid: Some(std::process::id()),
             foreground: hold,
+            bridge: bridged,
+            cdp_url,
             ..Record::default()
         };
         let served_root = format!("{SERVED_PREFIX}{id}");
@@ -364,8 +418,20 @@ impl Daemon {
             },
         );
         if !local {
-            match self.mint(&served_root, &entry_path, dir.is_none()) {
+            let mut body = json!({ "servedRoot": served_root, "entryPath": entry_path, "allowLive": dir.is_none() });
+            if bridged {
+                body["bridge"] = json!(true);
+                body["maxTabs"] = json!(max_tabs);
+                body["quiet"] = json!(quiet);
+                body["webhookId"] = json!(format!("scserve-{id}"));
+            }
+            match self.mint(&body) {
                 Ok((token, url, tray_id)) => {
+                    if bridged {
+                        let title = dir.clone().unwrap_or_else(|| format!("127.0.0.1:{port}"));
+                        self.bridge
+                            .register(&token, &public_url(&url, explicit), &title, quiet);
+                    }
                     record.preview_token = Some(token);
                     record.url = Some(public_url(&url, explicit));
                     record.tray_id = Some(tray_id);
@@ -388,13 +454,7 @@ impl Daemon {
         Ok(record)
     }
 
-    fn mint(
-        &self,
-        served_root: &str,
-        entry_path: &str,
-        live: bool,
-    ) -> Result<(String, String, String), HubError> {
-        let body = json!({ "servedRoot": served_root, "entryPath": entry_path, "allowLive": live });
+    fn mint(&self, body: &Value) -> Result<(String, String, String), HubError> {
         let call = |tray: &Tray| {
             self.hub.call(
                 "POST",
@@ -458,6 +518,15 @@ impl Daemon {
         self.store.remember(&tray);
         let socket = ws::connect(&self.hub, &url)?;
         let (out, rx) = channel();
+        self.bridge.relinking();
+        self.bridge.set_hub(out.clone());
+        let me = self.self_arc();
+        std::thread::spawn(move || {
+            std::thread::sleep(RELINK);
+            for ev in me.bridge.drop_stale() {
+                me.tell(&ev);
+            }
+        });
         let alive = Arc::new(AtomicBool::new(true));
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let previous = self.link.lock().unwrap().replace(Link {
@@ -666,6 +735,27 @@ impl Daemon {
                     }
                 });
             }
+            Some("bridge.connected") => {
+                if let Some(ev) = self.bridge.connected(&message) {
+                    self.tell(&ev);
+                }
+            }
+            Some("bridge.disconnected") => {
+                if let Some(ev) = self.bridge.disconnected(&message) {
+                    self.tell(&ev);
+                }
+            }
+            Some("webhook.event") => {
+                let ours = message
+                    .get("webhookId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|w| w.starts_with("scserve-"));
+                if let Some(ev) = ours.then(|| self.bridge.emitted(&message)).flatten() {
+                    self.tell(&ev);
+                }
+            }
+            Some("bridge.cdp.response") => self.bridge.responded(&message),
+            Some("preview.state") => self.bridge.preview_state(&message),
             Some("preview.revoked") => {
                 let token = message
                     .get("previewToken")
@@ -686,10 +776,27 @@ impl Daemon {
         }
     }
 
+    fn tell(&self, ev: &Value) {
+        let token = ev.get("previewToken").and_then(Value::as_str);
+        let holder = self
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .find(|e| e.record.preview_token.as_deref() == token)
+            .and_then(|e| e.holder.as_ref().and_then(|h| h.try_clone().ok()));
+        if let Some(mut holder) = holder {
+            line(&mut holder, &json!({ "event": ev }));
+        }
+    }
+
     fn stop(&self, id: &str, reason: &str, revoke: bool) -> bool {
         let Some(entry) = self.entries.lock().unwrap().remove(id) else {
             return false;
         };
+        if let (true, Some(token)) = (entry.record.bridge, entry.record.preview_token.as_deref()) {
+            self.bridge.unregister(token);
+        }
         self.touch();
         if let Some(server) = &entry.server {
             server.stop();

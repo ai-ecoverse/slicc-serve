@@ -54,3 +54,72 @@ pub fn render(rows: &[Value]) -> String {
     }
     out
 }
+
+pub fn printable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c < ' ' || c == '\u{7f}' || ('\u{80}'..='\u{9f}').contains(&c) {
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+pub fn log_line(r: &Value) -> String {
+    let t = |k: &str| printable(r.get(k).and_then(Value::as_str).unwrap_or("-"));
+    let event = t("event");
+    let disposition = match (event.as_str(), r.get("announced") == Some(&json!(true))) {
+        ("connected", true) => "announced",
+        ("connected", false) => "suppressed",
+        _ => "-",
+    };
+    let detail = match event.as_str() {
+        "connected" => format!("origin={} userAgent={}", t("origin"), t("userAgent")),
+        "disconnected" => format!("reason={}", t("reason")),
+        _ => format!("name={} detail={}", t("name"), t("detail")),
+    };
+    format!(
+        "{}  {:<12} {:<10} preview={} conn={} {detail}",
+        t("at"),
+        event,
+        disposition,
+        t("previewToken"),
+        t("connId")
+    )
+}
+
+pub fn event_line(cmd: &str, ev: &Value, url: &str) -> Vec<String> {
+    let t = |k: &str| printable(ev.get(k).and_then(Value::as_str).unwrap_or("-"));
+    let mut lines = Vec::new();
+    match t("event").as_str() {
+        "connected" => {
+            if ev.get("announced") == Some(&json!(true)) {
+                lines.push(format!(
+                    "{cmd}: first visitor on {url}: {} ({})",
+                    t("origin"),
+                    t("userAgent")
+                ));
+            }
+            lines.push(format!(
+                "{cmd}: connected {} {} {}",
+                t("connId"),
+                t("origin"),
+                t("userAgent")
+            ));
+        }
+        "disconnected" => lines.push(format!(
+            "{cmd}: disconnected {} {}",
+            t("connId"),
+            t("reason")
+        )),
+        _ => lines.push(format!(
+            "{cmd}: emit {} {} {}",
+            t("connId"),
+            t("name"),
+            t("detail")
+        )),
+    }
+    lines
+}
