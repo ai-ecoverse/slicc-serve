@@ -192,7 +192,7 @@ The options, the output, `--json` and the exit status are the host's, with `serv
 
 - **Who publishes:** seven's page, which leads a tray on the tray hub already. `serve` never talks to the hub: it asks the page with the [embedder kinds](#the-embedder-contract) below, and the page mints the preview and relays the hub's `preview.request` to `kernel.loopbackFetch`.
 - **Local URLs** are the page's names for the kernel's loopback: `http://<port>.kernel.localhost/` (from `SLICC_PAGE_LOOPBACK_URL`, else `http://127.0.0.1:<port>/`).
-- **`--ttl`** exits 1 with `serve: --ttl from SLICC needs seven's serve.snapshot, which isn't there yet` ([#4](https://github.com/ai-ecoverse/slicc-serve/issues/4)).
+- **`--ttl`** collects the snapshot itself, with the host's walker and limits, and hands the files to the page in the body of one `serve.snapshot` request; the page mints the snapshot, uploads the files and finalizes it ([`serve.snapshot`](#servesnapshot)). Nothing keeps running. The kernel doesn't upload itself: a program's `https://www.sliccy.ai/…` request through the kernel's proxy answers `502` in seven (measured from a seven branch preview with the page's transport, [#4](https://github.com/ai-ecoverse/slicc-serve/issues/4)), while the page reaches the hub, since it already leads a tray there.
 - **`--open`** asks the page for a tab with `open.url` (as [slicc-open](https://github.com/ai-ecoverse/slicc-open) does) once the URL is printed; a refusal prints `serve: <the page's message>` and leaves the exit status alone.
 - **`--upgrade`** prints `pnpm add -g @ai-ecoverse/slicc-serve@latest`.
 
@@ -210,7 +210,7 @@ serve DIR ──spawn──► serve (background, one per preview)
 - **`--port PORT`** publishes a server that already runs on the kernel's loopback: the background `serve` holds only the request. `serve: nothing answers on 127.0.0.1:PORT yet` warns as on a host.
 - **`--foreground`** does all of it in the `serve` process itself: it prints the URL, logs each request of the static server (`serve: GET /app.js 200 1234`), and Ctrl-C (or the end of the process) ends the request, which revokes the preview. When the page ends the reply, it prints `serve: stopped: <reason>` and exits 0.
 - **`--local DIR`** starts a background `serve` with the static server only, recorded as `local` (listed, stopped with `--stop`); `--local --foreground DIR` serves in the foreground; `--local --port PORT` prints the URL only. None of them asks the page.
-- **`--list`** asks the page with `serve.list` and joins its answer with the records, as the host joins the hub's list: `TOKEN MODE EXPIRES URL ROOT`, `(foreground)` for an attached one. A record whose process is gone is dropped, and so is one whose token the page doesn't list (its process is stopped). When no page answers (`ENOTSUP`, or no `/dev/embedder`), the records alone are listed.
+- **`--list`** asks the page with `serve.list` and joins its answer with the records, as the host joins the hub's list: `TOKEN MODE EXPIRES URL ROOT`, `(foreground)` for an attached one. A record whose process is gone is dropped (a snapshot's has no process and stays until it expires), and so is one whose token the page doesn't list (its process is stopped). When no page answers (`ENOTSUP`, or no `/dev/embedder`), the records alone are listed.
 - **`--stop`** matches its argument against the records as on a host (token, public URL, local URL, port or record id). A public preview is stopped with `serve.stop`, which ends its background `serve` through the page; a token or a public URL that matches no record is sent to the page all the same. When the page refuses, the matching record's process gets `SIGTERM` anyway, and the page's message exits 1. A local preview's process gets `SIGTERM`. Either way the record is removed, and it prints `stopped <token or local URL>`. Several matching records stop none, as on a host.
 - **State** is the host's layout in the kernel's file system: `<state>/previews/<id>.json` (`0600`) per preview, with the background process's pid, and `<state>/serve.log`, where `<state>` is `$SCSERVE_STATE_DIR`, else `$XDG_STATE_HOME/slicc/serve`, else `~/.local/state/slicc/serve`. There is no `tray.json` and no relay.
 
@@ -229,13 +229,14 @@ A failure the tray hub answered comes as the reply's first line instead (`{"erro
 
 ### The embedder contract
 
-This is what seven's page answers ([#6](https://github.com/ai-ecoverse/slicc-serve/issues/6)); `serve`'s tests run against a fake page that answers the same in a node kernel. Each request is one open of `/dev/embedder` (slicc-kernel 1.153.0 and later): a JSON header line `{"kind": …, …options}`, no body, then the reply until end-of-file. Option values are JSON, so no path or URL can break the header.
+This is what seven's page answers ([#6](https://github.com/ai-ecoverse/slicc-serve/issues/6)); `serve`'s tests run against a fake page that answers the same in a node kernel. Each request is one open of `/dev/embedder` (slicc-kernel 1.153.0 and later): a JSON header line `{"kind": …, …options}`, a body (`serve.snapshot` only), then the reply until end-of-file. Option values are JSON, so no path or URL can break the header.
 
 | kind | options | opened | reply | errors |
 | --- | --- | --- | --- | --- |
 | `serve.publish` | `port`, `root`, `entry`, `allowLive` | `O_RDWR` | one JSON line, `{"url","previewToken",…}` or `{"error",…}`; then held open until the preview ends, optionally one `{"stopped"}` line, then end-of-file | `EACCES`, `ENOTSUP`, `EIO` |
 | `serve.list` | none | `O_RDWR` | one JSON line per preview, then end-of-file; nothing when there are none | `ENOTSUP`, `EIO` |
 | `serve.stop` | `previewToken` | `O_WRONLY` | none; the close returns the errno | `ENOENT`, `ENOTSUP`, `EIO` |
+| `serve.snapshot` | `root`, `entry`, `ttlMs`, `files`, `bytes` | `O_RDWR` | after the body: one JSON line, `{"url","previewToken","expiresAt",…}` or `{"error",…}`, then end-of-file | `EACCES`, `ENOTSUP`, `EIO` |
 
 #### `serve.publish`
 
@@ -274,7 +275,7 @@ The relay itself (`preview.request` → `kernel.loopbackFetch(GET <path>, {port,
 {"kind":"serve.list"}
 ```
 
-The reply is one JSON object per line for each preview the page holds from `serve.publish` that the caller may see: those whose publishing process had the caller's uid, all of them for root. `{"previewToken", "url", "root", "port", "entry", "since"}`, with `root` and `entry` absent as in the request and `since` the mint's time in milliseconds since the epoch, which `serve --list` shows as `createdAt` (ISO 8601) when it has no record of its own. An empty reply means none.
+The reply is one JSON object per line for each preview the page holds from `serve.publish` or `serve.snapshot` that the caller may see: those whose publishing process had the caller's uid, all of them for root. `{"previewToken", "url", "root", "port", "entry", "since"}` for a live preview, with `root` and `entry` absent as in the request and `since` the mint's time in milliseconds since the epoch, which `serve --list` shows as `createdAt` (ISO 8601) when it has no record of its own. A snapshot's line has `"mode": "persistent"` and `"expiresAt"` (milliseconds since the epoch) and no `port`; a live one may say `"mode": "live"`. An empty reply means none.
 
 #### `serve.stop`
 
@@ -282,7 +283,44 @@ The reply is one JSON object per line for each preview the page holds from `serv
 {"kind":"serve.stop","previewToken":"0f3c….a91e…"}
 ```
 
-The page revokes the preview on the hub, drops it, and ends its `serve.publish` reply with `{"stopped":"stopped with serve --stop"}`, so the background `serve` that holds it exits. A token the page doesn't hold is revoked on the tray all the same; one the hub has no preview for throws `NotFoundError` (`ENOENT`), `the tray hub has no such preview`. A held preview of another uid, for a caller that isn't root, is `ENOENT` too.
+The page revokes the preview on the hub (a snapshot too, before its TTL), drops it, and ends a live preview's `serve.publish` reply with `{"stopped":"stopped with serve --stop"}`, so the background `serve` that holds it exits. A token the page doesn't hold is revoked on the tray all the same; one the hub has no preview for throws `NotFoundError` (`ENOENT`), `the tray hub has no such preview`. A held preview of another uid, for a caller that isn't root, is `ENOENT` too.
+
+#### `serve.snapshot`
+
+```
+{"kind":"serve.snapshot","root":"/home/me/site","ttlMs":604800000,"files":2,"bytes":1843}
+{"path":"index.html","type":"text/html; charset=utf-8","size":1800}
+<1800 bytes>
+{"path":"app/main.js","type":"text/javascript; charset=utf-8","size":43}
+<43 bytes>
+```
+
+`serve --ttl` walks the directory first, as on a host ([Snapshots](#snapshots---ttl)): the limits, the entry file and the names are checked before anything is sent. Then it opens the device `O_RDWR`, writes the header, writes every file as the body, and reads the reply: the kernel ends the body at the first read, so the reply comes once the page has read the whole body.
+
+| option | |
+| --- | --- |
+| `root` | string: the directory's absolute path, for the prompt only |
+| `entry` | string, absent without `--entry`: normalized as for `serve.publish` |
+| `ttlMs` | number: the TTL in milliseconds, 60000 to 2592000000 (30 days) |
+| `files`, `bytes` | numbers: how many files and bytes the body holds, for the prompt and to check the body against |
+
+**The body** is the files in order, each a JSON line `{"path", "type", "size"}` (at most 4 KiB) followed by exactly `size` bytes. `path` is the file's path in the snapshot, segments joined by `/`, as the host uploads it: no leading `/`, no empty, `.` or `..` segment, no segment starting with `.` (but `.well-known`), no `\`, `:` or NUL. `type` is the file's type from its extension, `size` at most 25 MiB. The body ends after the last file.
+
+What the page does, in order:
+
+1. **Who may publish, and the prompt:** as for `serve.publish`, before it reads the body: a follower or a seven without a tray hub is `ENOTSUP`, the switch "Public previews" off is `EACCES`, and unless `serve` was typed in seven's terminal with a gesture still active, it asks: "Publish a snapshot of /home/me/site (2 files, 1.8 KiB) at a public URL for 7 days?". Cancel or no answer is `EACCES`, with its message.
+2. **The mint:** `POST /api/tray/<trayId>/preview` `{servedRoot, entryPath, allowLive: false, ttlMs}`, with `servedRoot` and `entryPath` made as for `serve.publish`. The answer's `uploadToken` stays in the page.
+3. **The uploads:** on `*.sliccy.ai` the page reaches the hub through sliccy-ai's same-origin proxy, which forwards `preview/<token>/file` and `preview/<token>/finalize` for this ([sliccy-ai#162](https://github.com/ai-ecoverse/sliccy-ai/pull/162)); elsewhere it calls the hub directly. For each file of the body, `PUT /api/tray/<trayId>/preview/<previewToken>/file?path=<path>` with the upload token as the bearer, `Content-Type: <type>` and the bytes. The page may upload a few at a time, and may report progress with `request.progress` (`uploaded 12 of 40 files`), which `serve` shows on its standard error.
+4. **The finalize:** `POST /api/tray/<trayId>/preview/<previewToken>/finalize` with the upload token, once the body has ended.
+5. **The reply:** one line `{"url": <the hub's url>, "previewToken", "trayId"?, "expiresAt": <milliseconds since the epoch>, "files", "bytes"}` and a newline, then end-of-file. The page keeps the snapshot for `serve.list` and `serve.stop` (with `stamp.uid`, `root`, `entry`, `since`, `expiresAt`) until it expires or is stopped, across reloads, since a snapshot outlives the page.
+
+When it fails, the page answers at once, without reading the rest of the body: with an error, or with the failure line as a string (never a stream). The kernel then drops whatever `serve` still writes ([slicc-kernel#1536](https://github.com/ai-ecoverse/slicc-kernel/issues/1536)), so `serve` never waits on a body nobody reads; it gets the errno from its next write or from its read, and the failure line from its read.
+
+
+- **The body is wrong** (a line that isn't the JSON above, a path or type that breaks the rules, a `size` over 25 MiB, a body that ends inside a file, more than 1,000 files or 50 MiB, the same path twice, or files and bytes that don't add up to exactly `files` and `bytes` when the body ends, so what is finalized is what the prompt showed): the page stops the snapshot on the hub (`POST …/preview/stop`) and throws an `EIO` error `bad snapshot body: <what>`.
+- **The hub answered a failure** to the mint, an upload or the finalize: the page stops a minted snapshot, and the reply is the failure line of `serve.publish` (`{"error", "status", "code"?, "retryAfter"?, "signIn"?, "active"?, "limit"?}`), with `"during": "mint"`, `"upload"` or `"finalize"`, and for an upload `"path"`. `serve` says `publishing the snapshot` for the mint and `uploading the snapshot` otherwise, adds ` (<path>)` to the hub's error for an upload, and maps the status to exits 1, 3 and 4 as for `serve.publish`. `PREVIEW_LIMIT` (`429`, the tray's 10 snapshots) is exit 4.
+- **The hub can't be reached:** the page stops a minted snapshot if it can, and throws an `EIO` error with the reason.
+- **`serve` goes away** before the reply (Ctrl-C, `kill`): the kernel aborts the request; a snapshot not yet finalized is stopped on the hub. One already finalized stays, and `serve --list` shows it from `serve.list`.
 
 ## Development
 
