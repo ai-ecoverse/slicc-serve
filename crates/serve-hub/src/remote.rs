@@ -80,15 +80,21 @@ pub fn call(this: Option<&str>, function: &str, args: &[String], by_value: bool)
     let this = this
         .map(|p| format!("get({})", literal(p)))
         .unwrap_or_else(|| "undefined".into());
+    let source = literal(&format!("({function})"));
     wrap(&format!(
-        "const self = {this}; const args = [{}]; return Promise.resolve(({function}).apply(self, args)).then((v) => JSON.stringify({finish}(v)));",
+        "const f = (0, eval)({source}); return Promise.resolve(Reflect.apply(f, {this}, [{}])).then((v) => JSON.stringify({finish}(v)));",
         args.join(", ")
     ))
 }
 
-pub fn properties(page: &str) -> String {
+pub fn properties(page: &str, accessors_only: bool) -> String {
     wrap(&format!(
-        "const o = get({}); return JSON.stringify(Object.getOwnPropertyNames(o).map((name) => {{ let v; try {{ v = o[name]; }} catch (e) {{ v = undefined; }} return {{ name, value: desc(v) }}; }}));",
+        "const o = get({}); const all = Object.getOwnPropertyDescriptors(o); \
+return JSON.stringify(Reflect.ownKeys(all).filter((k) => typeof k === 'string').flatMap((name) => {{ const d = all[name]; \
+const accessor = 'get' in d || 'set' in d; if ({accessors_only} && !accessor) return []; \
+const p = {{ name, configurable: d.configurable, enumerable: d.enumerable }}; \
+if (accessor) {{ if (d.get !== undefined) p.get = desc(d.get); if (d.set !== undefined) p.set = desc(d.set); }} \
+else {{ p.value = desc(d.value); p.writable = d.writable; }} return [p]; }}));",
         literal(page)
     ))
 }
@@ -186,14 +192,21 @@ pub fn listed(conn: &str, reply: Value) -> Result<Value, (i64, String)> {
     let props: Vec<Value> = items
         .iter()
         .map(|p| {
-            json!({
+            let mut out = json!({
                 "name": p.get("name").cloned().unwrap_or(Value::Null),
-                "value": remote(conn, p.get("value").unwrap_or(&Value::Null)),
-                "configurable": true,
-                "enumerable": true,
-                "writable": true,
+                "configurable": p.get("configurable").cloned().unwrap_or(json!(true)),
+                "enumerable": p.get("enumerable").cloned().unwrap_or(json!(true)),
                 "isOwn": true,
-            })
+            });
+            for k in ["value", "get", "set"] {
+                if let Some(v) = p.get(k) {
+                    out[k] = remote(conn, v);
+                }
+            }
+            if let Some(w) = p.get("writable") {
+                out["writable"] = w.clone();
+            }
+            out
         })
         .collect();
     Ok(json!({ "result": props }))

@@ -531,6 +531,11 @@ describe('serve --bridge in seven', { skip }, () => {
     const [record] = await records();
     assert.equal(record.bridge, true);
     assert.match(record.cdpUrl, /^ws:\/\/127\.0\.0\.1:9222\//);
+    const listed = JSON.parse((await run(['serve', '--list', '--json'])).stdout);
+    assert.deepEqual(
+      listed.map((r) => [r.previewToken, r.cdpUrl]),
+      [[preview.token, record.cdpUrl]]
+    );
   });
 
   it('stops a preview the page published without the bridge', async () => {

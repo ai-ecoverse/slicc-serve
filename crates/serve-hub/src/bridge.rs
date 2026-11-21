@@ -178,7 +178,11 @@ fn translate(conn: &str, method: &str, params: &Value) -> Result<Translated, (i6
         }
         "Runtime.getProperties" => {
             let id = page(object.unwrap_or(""))?;
-            (evaluate(remote::properties(&id), params), Shape::Properties)
+            let accessors = params.get("accessorPropertiesOnly") == Some(&json!(true));
+            (
+                evaluate(remote::properties(&id, accessors), params),
+                Shape::Properties,
+            )
         }
         "DOM.describeNode" => {
             let backend = params.get("backendNodeId").and_then(Value::as_u64);
@@ -645,6 +649,7 @@ impl Bridge {
         if let (Some(group), Ok(r)) = (&p.group, &outcome) {
             if let Some(page) = r
                 .pointer("/result/objectId")
+                .or_else(|| r.pointer("/object/objectId"))
                 .and_then(Value::as_str)
                 .and_then(|id| remote::page_id(&p.conn, id))
             {

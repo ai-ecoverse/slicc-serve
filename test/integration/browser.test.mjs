@@ -62,8 +62,8 @@ after(async () => {
   await hub.close();
 });
 
-async function visit(box) {
-  const res = await box.run(['--bridge', '--json', box.site({ 'index.html': PAGE })]);
+async function visit(box, html = PAGE) {
+  const res = await box.run(['--bridge', '--json', box.site({ 'index.html': html })]);
   assert.equal(res.code, 0, res.stderr);
   const out = JSON.parse(res.stdout);
   const visitor = await cdp(browser.wsUrl);
@@ -244,6 +244,123 @@ test('a handle is the object, not its expression: calling a function on it runs 
   const after = await page();
   assert.equal(after.clicks, 1);
   assert.equal(after.submits, 1);
+  client.close();
+  await close();
+});
+
+const GLOBALS = PAGE.replace(
+  '<head>',
+  "<head><script>var args = 'page-args'; var get = 'page-get'; var R = 'page-R'; var f = 'page-f';</script>"
+);
+
+test("callFunctionOn runs the client's function at the page's global scope, getProperties doesn't run getters, and resolveNode joins its object group", async () => {
+  const box = sandbox(hub);
+  const { ws, target, close } = await visit(box, GLOBALS);
+  const client = await cdp(ws);
+  const attached = await client.send('Target.attachToTarget', {
+    targetId: target.id,
+    flatten: true,
+  });
+  const s = attached.result.sessionId;
+  const button = await client.send(
+    'Runtime.evaluate',
+    { expression: 'document.querySelector("#buy")' },
+    s
+  );
+  const globals = await client.send(
+    'Runtime.callFunctionOn',
+    {
+      objectId: button.result.result.objectId,
+      functionDeclaration:
+        'function () { return [this.id, args, get, R, f, typeof self === "object" && self === window]; }',
+      returnByValue: true,
+    },
+    s
+  );
+  assert.deepEqual(globals.result.result.value, [
+    'buy',
+    'page-args',
+    'page-get',
+    'page-R',
+    'page-f',
+    true,
+  ]);
+
+  const object = await client.send(
+    'Runtime.evaluate',
+    {
+      expression:
+        '({ get boom() { window.boomed = (window.boomed || 0) + 1; return 1; }, set only(v) {}, plain: 2 })',
+    },
+    s
+  );
+  const id = object.result.result.objectId;
+  const own = await client.send('Runtime.getProperties', { objectId: id, ownProperties: true }, s);
+  const byName = Object.fromEntries(own.result.result.map((p) => [p.name, p]));
+  assert.deepEqual(Object.keys(byName).sort(), ['boom', 'only', 'plain']);
+  assert.equal(byName.boom.get.type, 'function');
+  assert.ok(byName.boom.get.objectId);
+  assert.equal(byName.boom.value, undefined);
+  assert.equal(byName.only.set.type, 'function');
+  assert.equal(byName.only.get, undefined);
+  assert.deepEqual(byName.plain.value, { type: 'number', value: 2 });
+  assert.equal(byName.plain.writable, true);
+  const accessors = await client.send(
+    'Runtime.getProperties',
+    { objectId: id, ownProperties: true, accessorPropertiesOnly: true },
+    s
+  );
+  assert.deepEqual(accessors.result.result.map((p) => p.name).sort(), ['boom', 'only']);
+  const boomed = await client.send(
+    'Runtime.evaluate',
+    { expression: 'window.boomed ?? 0', returnByValue: true },
+    s
+  );
+  assert.deepEqual(boomed.result.result, { type: 'number', value: 0 });
+
+  const described = await client.send(
+    'DOM.describeNode',
+    { objectId: button.result.result.objectId },
+    s
+  );
+  const resolved = await client.send(
+    'DOM.resolveNode',
+    { backendNodeId: described.result.node.backendNodeId, objectGroup: 'g1' },
+    s
+  );
+  const handle = resolved.result.object.objectId;
+  const before = await client.send(
+    'Runtime.callFunctionOn',
+    {
+      objectId: handle,
+      functionDeclaration: 'function () { return this.id; }',
+      returnByValue: true,
+    },
+    s
+  );
+  assert.deepEqual(before.result.result, { type: 'string', value: 'buy' });
+  await client.send('Runtime.releaseObjectGroup', { objectGroup: 'g1' }, s);
+  const after = await client.send(
+    'Runtime.callFunctionOn',
+    {
+      objectId: handle,
+      functionDeclaration: 'function () { return this.id; }',
+      returnByValue: true,
+    },
+    s
+  );
+  assert.equal(after.error?.code, -32000);
+  assert.match(after.error.message, /gone/);
+  const still = await client.send(
+    'Runtime.callFunctionOn',
+    {
+      objectId: button.result.result.objectId,
+      functionDeclaration: 'function () { return this.id; }',
+      returnByValue: true,
+    },
+    s
+  );
+  assert.deepEqual(still.result.result, { type: 'string', value: 'buy' });
   client.close();
   await close();
 });
