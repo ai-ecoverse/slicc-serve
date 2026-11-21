@@ -84,7 +84,12 @@ impl Store {
         self.all()
             .into_iter()
             .filter(|r| {
-                let alive = r.pid.is_some_and(sys::alive);
+                let alive = if r.mode == "persistent" {
+                    let now = serve_core::time::iso(serve_core::time::now_ms());
+                    r.expires_at.as_deref().is_some_and(|e| e > now.as_str())
+                } else {
+                    r.pid.is_some_and(sys::alive)
+                };
                 if !alive {
                     self.remove(&r.id);
                 }

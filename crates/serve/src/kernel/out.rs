@@ -41,8 +41,20 @@ impl Failure {
                     "; list them with `{cmd} --list` and stop the ones you no longer need with `{cmd} --stop <token>`"
                 ))
             }
+            Some("PREVIEW_LIMIT") => {
+                let count = |k: &str| answer.get(k).and_then(Value::as_u64);
+                if let (Some(active), Some(limit)) = (count("active"), count("limit")) {
+                    error.push_str(&format!(" ({active} of {limit} --ttl snapshots in use)"));
+                }
+                error.push_str(&format!(
+                    "; list them with `{cmd} --list` and free one with `{cmd} --stop <token>`"
+                ))
+            }
             Some(code) => error.push_str(&format!(" ({code})")),
             None => {}
+        }
+        if let Some(path) = text("path") {
+            error.push_str(&format!(" ({path})"));
         }
         let sign_in = text("signIn");
         let (exit, mut lines) = match status {
@@ -144,10 +156,28 @@ pub fn page_url(port: u16) -> String {
     }
 }
 
+fn size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / 1048576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 pub fn done(cmd: &str, record: &Record, opts: &Serve) -> i32 {
+    snapshot_done(cmd, record, opts, None)
+}
+
+pub fn snapshot_done(cmd: &str, record: &Record, opts: &Serve, extra: Option<(usize, u64)>) -> i32 {
     let url = record.shown_url().to_string();
     if opts.json {
         let mut value = serde_json::to_value(record).unwrap_or(Value::Null);
+        if let Some((files, bytes)) = extra {
+            value["files"] = json!(files);
+            value["bytes"] = json!(bytes);
+        }
         if let Some(map) = value.as_object_mut() {
             map.remove("id");
             map.remove("pid");
@@ -162,6 +192,14 @@ pub fn done(cmd: &str, record: &Record, opts: &Serve) -> i32 {
             .or_else(|| record.port.map(|p| format!("127.0.0.1:{p}")))
             .unwrap_or_default();
         match (&record.preview_token, record.foreground) {
+            (Some(token), _) if record.mode == "persistent" => {
+                let (files, bytes) = extra.unwrap_or_default();
+                eprintln!(
+                    "{cmd}: a snapshot of {what} ({files} files, {}) until {}; stop it sooner with: {cmd} --stop {token}",
+                    size(bytes),
+                    record.expires_at.as_deref().unwrap_or("-")
+                );
+            }
             (Some(token), false) => {
                 let here = record
                     .local_url

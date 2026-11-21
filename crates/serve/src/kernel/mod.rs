@@ -4,6 +4,7 @@ mod out;
 mod page;
 mod store;
 mod sys;
+mod ttl;
 
 use hold::Spec;
 use out::Failure;
@@ -86,11 +87,6 @@ fn warn_unanswered(cmd: &str, port: u16) {
 }
 
 fn serve(cmd: &str, opts: &Serve) -> i32 {
-    if opts.ttl_ms.is_some() {
-        let line =
-            format!("{cmd}: --ttl from SLICC needs seven's serve.snapshot, which isn't there yet");
-        return out::fail(&Failure::plain(line), opts.json);
-    }
     if let (true, Some(port)) = (opts.local, opts.port) {
         warn_unanswered(cmd, port);
         let record = Record {
@@ -115,6 +111,9 @@ fn serve(cmd: &str, opts: &Serve) -> i32 {
         Ok(d) => d,
         Err(f) => return out::fail(&f, opts.json),
     };
+    if let (Some(dir), Some(ttl_ms)) = (&dir, opts.ttl_ms) {
+        return ttl::publish(cmd, dir, ttl_ms, opts);
+    }
     if let (None, Some(port)) = (&dir, opts.port) {
         warn_unanswered(cmd, port);
     }
