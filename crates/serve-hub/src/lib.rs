@@ -12,6 +12,7 @@ pub mod list;
 pub mod open;
 pub mod records;
 pub mod relay;
+pub mod remote;
 pub mod tray;
 pub mod ttl;
 pub mod upgrade;

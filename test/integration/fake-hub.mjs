@@ -1,8 +1,19 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { createServer, request } from 'node:http';
+import { createRequire } from 'node:module';
 
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const PREVIEW_HOST = /^([0-9a-f]{32})--(?:[0-9a-f]{8}-)?([0-9a-f]+)\.localhost(?::\d+)?$/i;
+
+let bridgeJs;
+
+function bootstrap() {
+  bridgeJs ??= readFileSync(
+    createRequire(import.meta.url).resolve('@ai-ecoverse/cherry/preview-bridge.js')
+  );
+  return bridgeJs;
+}
 
 function hex(n) {
   return randomBytes(n).toString('hex');
@@ -437,6 +448,10 @@ export async function fakeHub() {
       return res.end('Preview not found');
     }
     const { tray, preview } = found;
+    if (preview.bridge && url.pathname === '/__slicc/preview-bridge.js') {
+      res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' });
+      return res.end(bootstrap());
+    }
     if (preview.mode === 'persistent') {
       const path =
         url.pathname === '/' ? preview.entryRel : decodeURIComponent(url.pathname.slice(1));
@@ -501,12 +516,21 @@ export async function fakeHub() {
       });
       return res.end(result.body);
     }
+    let body = result.body;
+    if (preview.bridge && /^text\/html/i.test(result.mime ?? '')) {
+      const script = `<script src="/__slicc/preview-bridge.js" data-slicc-token="${preview.previewToken}" data-slicc-ws="ws://${req.headers.host}/__slicc/bridge"></script>`;
+      const html = body.toString('utf8');
+      const at = html.search(/<head[^>]*>/i);
+      body = Buffer.from(
+        at === -1 ? `${script}${html}` : html.replace(/<head[^>]*>/i, (head) => `${head}${script}`)
+      );
+    }
     res.writeHead(200, {
       'content-type': result.mime,
       'x-encoding': result.encoding,
       'x-chunks': String(result.totalChunks),
     });
-    return res.end(result.body);
+    return res.end(body);
   }
 
   function applyRule(res, rule) {

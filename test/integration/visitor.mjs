@@ -20,6 +20,16 @@ export function visitor({
   elements = {},
   fetch = globalThis.fetch,
 } = {}) {
+  class Node {
+    constructor(name) {
+      this.nodeType = 1;
+      this.nodeName = name.toUpperCase();
+      this.localName = name;
+      this.childNodes = [];
+      this.attributes = [];
+    }
+  }
+  const button = new Node('button');
   for (const el of Object.values(elements)) {
     el.scrollIntoView ??= () => {};
     el.getBoundingClientRect ??= () => ({ x: 10, y: 20, width: 100, height: 40 });
@@ -33,10 +43,10 @@ export function visitor({
     elementFromPoint: () => Object.values(elements)[0] ?? null,
   };
   const context = createContext({
-    __sliccAriaElements: [{ tagName: 'BUTTON' }],
+    __sliccAriaElements: [button],
     HTMLIFrameElement: class {},
     Element: class {},
-    Node: class {},
+    Node,
     URL,
     fetch,
     btoa,

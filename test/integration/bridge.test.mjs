@@ -192,11 +192,11 @@ test('visitor tabs become CDP targets that a client drives through the hub', asy
   const sent = tab.requests.at(-1);
   assert.equal(sent.method, 'Runtime.evaluate');
   assert.equal(sent.sessionId, session);
-  assert.ok(sent.params.expression.startsWith('Promise.resolve((0, eval)("6*7"))'));
-  const unsupported = await c.send('DOM.describeNode', {}, session);
+  assert.ok(sent.params.expression.includes('(0, eval)("6*7")'));
+  const unsupported = await c.send('DOM.getContentQuads', {}, session);
   assert.deepEqual(unsupported.error, {
     code: -32601,
-    message: 'DOM.describeNode is not supported',
+    message: 'DOM.getContentQuads is not supported',
   });
   const navigated = await c.send('Page.navigate', { url: `${url}next.html` }, session);
   assert.equal(navigated.result.frameId, 'preview-frame');
@@ -349,6 +349,29 @@ test('--quiet records the first visit without announcing it, and --max-tabs caps
   });
   proc.child.kill();
   await proc.exited;
+});
+
+test("--logs keeps a stopped preview's records and refuses a preview the relay never bridged", async () => {
+  const box = sandbox(hub);
+  const { out, url } = await bridged(box);
+  const plain = await box.run([box.site({ 'index.html': 'x' }, 'plain')]);
+  const tab = await hub.tab(url);
+  await eventually(
+    async () => JSON.parse((await box.run(['--logs', '--json'])).stdout).length === 1
+  );
+  assert.equal((await box.run(['--stop', url])).code, 0);
+  await eventually(() => tab.closed);
+  const kept = JSON.parse((await box.run(['--logs', out.previewToken, '--json'])).stdout);
+  assert.deepEqual(
+    kept.map((r) => r.event),
+    ['connected', 'disconnected']
+  );
+  const token = previewOf(plain.stdout.trim()).previewToken;
+  assert.deepEqual(await box.run(['--logs', token]), {
+    code: 1,
+    stdout: '',
+    stderr: `scserve: no preview matches ${token}\n`,
+  });
 });
 
 test('--logs and --truncate without a relay find nothing', async () => {

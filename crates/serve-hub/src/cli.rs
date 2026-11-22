@@ -190,6 +190,15 @@ fn logs_cmd(
         Err(code) => return code,
     };
     let reply = relay_op(dirs, json!({ "op": "logs", "previewToken": token }));
+    if let (Some(target), Some(false)) = (
+        target,
+        reply
+            .as_ref()
+            .and_then(|r| r.get("known").and_then(Value::as_bool)),
+    ) {
+        let _ = writeln!(err, "{NAME}: no preview matches {target}");
+        return Exit::Failure.code();
+    }
     let mut records: Vec<Value> = reply
         .and_then(|r| r.get("records").and_then(Value::as_array).cloned())
         .unwrap_or_default();
