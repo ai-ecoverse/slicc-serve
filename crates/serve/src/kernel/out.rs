@@ -30,28 +30,9 @@ impl Failure {
     pub fn hub(cmd: &str, answer: &Value, doing: &str) -> Failure {
         let text = |k: &str| answer.get(k).and_then(Value::as_str).map(str::to_string);
         let status = answer.get("status").and_then(Value::as_u64).unwrap_or(0);
-        let mut error = text("error").unwrap_or_else(|| "the tray hub failed".into());
-        match text("code").as_deref() {
-            Some("LIVE_PREVIEW_LIMIT") => {
-                let count = |k: &str| answer.get(k).and_then(Value::as_u64);
-                if let (Some(active), Some(limit)) = (count("active"), count("limit")) {
-                    error.push_str(&format!(" ({active} of {limit} live previews in use)"));
-                }
-                error.push_str(&format!(
-                    "; list them with `{cmd} --list` and stop the ones you no longer need with `{cmd} --stop <token>`"
-                ))
-            }
-            Some("PREVIEW_LIMIT") => {
-                let count = |k: &str| answer.get(k).and_then(Value::as_u64);
-                if let (Some(active), Some(limit)) = (count("active"), count("limit")) {
-                    error.push_str(&format!(" ({active} of {limit} --ttl snapshots in use)"));
-                }
-                error.push_str(&format!(
-                    "; list them with `{cmd} --list` and free one with `{cmd} --stop <token>`"
-                ))
-            }
-            Some(code) => error.push_str(&format!(" ({code})")),
-            None => {}
+        let mut error = text("error").unwrap_or_else(|| "the serve hub failed".into());
+        if let Some(code) = text("code") {
+            error.push_str(&format!(" ({code})"));
         }
         if let Some(path) = text("path") {
             error.push_str(&format!(" ({path})"));
@@ -61,26 +42,26 @@ impl Failure {
             401 | 403 => (
                 Exit::Auth,
                 vec![format!(
-                    "{cmd}: {doing}: the tray hub refused it ({status}: {error})"
+                    "{cmd}: {doing}: the serve hub refused it ({status}: {error})"
                 )],
             ),
             402 | 429 => (
                 Exit::Quota,
                 vec![format!(
-                    "{cmd}: {doing}: the tray hub's limit is reached ({status}: {error})"
+                    "{cmd}: {doing}: the serve hub's limit is reached ({status}: {error})"
                 )],
             ),
             _ if sign_in.is_some() => (
                 Exit::Auth,
                 vec![format!(
-                    "{cmd}: the tray hub wants you to sign in: {}",
+                    "{cmd}: the serve hub wants you to sign in: {}",
                     sign_in.clone().unwrap_or_default()
                 )],
             ),
             _ => (
                 Exit::Failure,
                 vec![format!(
-                    "{cmd}: {doing}: the tray hub answered {status}: {error}"
+                    "{cmd}: {doing}: the serve hub answered {status}: {error}"
                 )],
             ),
         };

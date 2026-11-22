@@ -222,9 +222,9 @@ test('--stop of something unknown exits 1', async () => {
   let res = await box.run(['--stop', 'nothing']);
   assert.equal(res.code, 1);
   assert.equal(res.stderr, 'scserve: no preview matches nothing\n');
-  res = await box.run(['--stop', '00000000-0000-4000-a000-000000000000.abcdef', '--json']);
+  res = await box.run(['--stop', `${'0'.repeat(20)}-${'a'.repeat(32)}`, '--json']);
   assert.equal(res.code, 1);
-  assert.match(res.stderr, /is not a preview of this machine's trays/);
+  assert.match(res.stderr, /is not a preview of this machine's host/);
   assert.equal(JSON.parse(res.stdout).exit, 1);
 });
 

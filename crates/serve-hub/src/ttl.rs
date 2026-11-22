@@ -1,12 +1,12 @@
 use crate::daemon::Failure;
 use crate::fsx;
+use crate::host::{self, Host, Store};
 use crate::hub::{Hub, HubError, Payload};
 use crate::records::Records;
-use crate::tray::{self, Store, Tray};
 use serde_json::{json, Value};
 use serve_core::record::{public_url, Record};
 use serve_core::snapshot::{self, File};
-use serve_core::{time, NAME, SERVED_PREFIX};
+use serve_core::{safe, time, NAME, SERVED_PREFIX};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -19,12 +19,7 @@ pub struct Snapshot {
     pub bytes: u64,
 }
 
-struct Minted {
-    token: String,
-    upload: String,
-}
-
-fn upload_all(hub: &Hub, tray: &Tray, minted: &Minted, files: &[File]) -> Result<(), HubError> {
+fn upload_all(hub: &Hub, host: &Host, token: &str, files: &[File]) -> Result<(), HubError> {
     let next = AtomicUsize::new(0);
     let failure: Mutex<Option<HubError>> = Mutex::new(None);
     std::thread::scope(|scope| {
@@ -40,13 +35,12 @@ fn upload_all(hub: &Hub, tray: &Tray, minted: &Minted, files: &[File]) -> Result
                         message: format!("can't read {}: {e}", file.path),
                     })
                     .and_then(|bytes| {
-                        let mut url =
-                            tray::api(hub, tray, &format!("preview/{}/file", minted.token));
-                        url.query_pairs_mut().append_pair("path", &file.path);
+                        let path = safe::url_path(&file.path);
+                        let url = host::api(hub, host, &format!("previews/{token}/files{path}"));
                         hub.call(
                             "PUT",
                             url,
-                            Some(&minted.upload),
+                            Some(&host.secret),
                             Payload::Bytes(bytes, file.mime.to_string()),
                         )
                     });
@@ -80,6 +74,15 @@ fn tag(error: HubError, path: &str) -> HubError {
             message: format!("{message} ({path})"),
             code,
         },
+        HubError::Gone {
+            status,
+            message,
+            code,
+        } => HubError::Gone {
+            status,
+            message: format!("{message} ({path})"),
+            code,
+        },
         other => other,
     }
 }
@@ -101,41 +104,36 @@ pub fn publish(
         )));
     }
     let id = fsx::random_hex(8);
-    let served_root = format!("{SERVED_PREFIX}{id}");
-    let entry_path = format!("{served_root}/{entry_rel}");
+    let tag = format!("{SERVED_PREFIX}{id}");
     let body = json!({
-        "servedRoot": served_root,
-        "entryPath": entry_path,
-        "allowLive": false,
+        "entry": entry.map_or_else(|| "/".into(), safe::url_path),
+        "tag": tag,
         "ttlMs": ttl_ms,
     });
-    let keep = |t: &Tray| records.holds_snapshots(&t.tray_id);
-    let (value, tray) = store
-        .with_tray(hub, &keep, |tray| {
+    let (value, host) = store
+        .with_host(hub, |host| {
             hub.call(
                 "POST",
-                tray::api(hub, tray, "preview"),
-                Some(&tray.controller_token),
+                host::api(hub, host, "previews"),
+                Some(&host.secret),
                 Payload::Json(body.clone()),
             )
         })
         .map_err(|e| Failure::hub(&e, "publishing the snapshot"))?;
     let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
-    let (Some(token), Some(upload)) = (text(&value, "previewToken"), text(&value, "uploadToken"))
-    else {
+    let Some(token) = text(&value, "previewToken") else {
         return Err(Failure::hub(
             &HubError::Protocol {
-                message: "the tray hub's mint answer has no upload capability".into(),
+                message: "the serve hub's mint answer has no previewToken".into(),
             },
             "publishing the snapshot",
         ));
     };
-    let minted = Minted { token, upload };
-    let finished = upload_all(hub, &tray, &minted, &files).and_then(|_| {
+    let finished = upload_all(hub, &host, &token, &files).and_then(|_| {
         hub.call(
             "POST",
-            tray::api(hub, &tray, &format!("preview/{}/finalize", minted.token)),
-            Some(&minted.upload),
+            host::api(hub, &host, &format!("previews/{token}/finalize")),
+            Some(&host.secret),
             Payload::None,
         )
     });
@@ -143,10 +141,10 @@ pub fn publish(
         Ok(v) => v,
         Err(e) => {
             let _ = hub.call(
-                "POST",
-                tray::api(hub, &tray, "preview/stop"),
-                Some(&tray.controller_token),
-                Payload::Json(json!({ "previewToken": minted.token })),
+                "DELETE",
+                host::api(hub, &host, &format!("previews/{token}")),
+                Some(&host.secret),
+                Payload::None,
             );
             return Err(Failure::hub(&e, "uploading the snapshot"));
         }
@@ -155,17 +153,25 @@ pub fn publish(
         .or_else(|| text(&value, "url"))
         .unwrap_or_default();
     let now = time::now_ms();
+    let expires = done
+        .get("expiresAt")
+        .and_then(|v| {
+            v.as_u64()
+                .map(time::iso)
+                .or_else(|| v.as_str().map(str::to_string))
+        })
+        .unwrap_or_else(|| time::iso(now + ttl_ms));
     let record = Record {
         id,
         mode: "persistent".into(),
-        preview_token: Some(minted.token),
+        preview_token: Some(token),
         url: Some(public_url(&url, entry.is_some())),
         root: Some(dir.display().to_string()),
         entry: entry.map(str::to_string),
-        tray_id: Some(tray.tray_id.clone()),
-        served_root: Some(served_root),
+        host_id: Some(host.host_id.clone()),
+        tag: Some(tag),
         created_at: time::iso(now),
-        expires_at: Some(time::iso(now + ttl_ms)),
+        expires_at: Some(expires),
         ..Record::default()
     };
     let _ = records.save(&record);

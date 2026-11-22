@@ -1,17 +1,17 @@
 use crate::bridge::Bridge;
 use crate::cdp::{self, Endpoint};
 use crate::fsx;
+use crate::host::{self, Host, Store};
 use crate::hub::{Hub, HubError, Payload};
 use crate::records::Records;
-use crate::relay::{self, Origin};
-use crate::tray::{self, Store, Tray};
+use crate::relay::{self, Stream};
 use crate::ws;
 use serde_json::{json, Value};
 use serve_core::exit::Exit;
 use serve_core::paths::Dirs;
 use serve_core::record::{public_url, Record};
 use serve_core::server::{self, Site};
-use serve_core::{time, NAME, SERVED_PREFIX};
+use serve_core::{safe, time, NAME, SERVED_PREFIX};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -67,6 +67,12 @@ impl ServerHandle {
     }
 }
 
+#[derive(Clone)]
+struct Origin {
+    port: u16,
+    tag: String,
+}
+
 struct Entry {
     record: Record,
     origin: Option<Origin>,
@@ -75,8 +81,29 @@ struct Entry {
 }
 
 struct Link {
-    tray: Tray,
+    host: Host,
     alive: Arc<AtomicBool>,
+}
+
+struct Conn {
+    out: Sender<Message>,
+    streams: Mutex<HashMap<u32, Arc<Stream>>>,
+}
+
+impl Conn {
+    fn text(&self, value: Value) {
+        let _ = self.out.send(Message::text(value.to_string()));
+    }
+
+    fn stream(&self, id: u32) -> Option<Arc<Stream>> {
+        self.streams.lock().unwrap().get(&id).cloned()
+    }
+
+    fn cancel_all(&self) {
+        for (_, stream) in self.streams.lock().unwrap().drain() {
+            stream.cancel();
+        }
+    }
 }
 
 pub struct Daemon {
@@ -91,7 +118,6 @@ pub struct Daemon {
     generation: AtomicU64,
     busy: AtomicUsize,
     activity: Mutex<Instant>,
-    agent: ureq::Agent,
     bridge: Arc<Bridge>,
     endpoint: Mutex<Option<Endpoint>>,
     info: Mutex<Value>,
@@ -99,7 +125,7 @@ pub struct Daemon {
 }
 
 pub fn hub_from_env() -> String {
-    std::env::var("SLICC_TRAY_HUB")
+    std::env::var("SLICC_SERVE_HUB")
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| serve_core::DEFAULT_HUB.to_string())
@@ -144,7 +170,6 @@ pub fn run(dirs: Dirs) -> i32 {
         generation: AtomicU64::new(0),
         busy: AtomicUsize::new(0),
         activity: Mutex::new(Instant::now()),
-        agent: relay::agent(),
         bridge: Arc::new(Bridge::new(serve_core::version())),
         endpoint: Mutex::new(None),
         info: Mutex::new(Value::Null),
@@ -281,8 +306,9 @@ impl Daemon {
         let wanted = request.get("hub").and_then(Value::as_str).unwrap_or("");
         let result = if !wanted.is_empty() && wanted != self.hub.origin() {
             Err(Failure::plain(format!(
-                "{NAME}: a relay for another tray hub ({}) is running; stop its previews first",
-                self.hub.origin()
+                "{NAME}: a relay for another serve hub ({}, pid {}) is running; its previews end when it stops",
+                self.hub.origin(),
+                std::process::id()
             )))
         } else {
             self.publish(request, hold)
@@ -401,13 +427,10 @@ impl Daemon {
             cdp_url,
             ..Record::default()
         };
-        let served_root = format!("{SERVED_PREFIX}{id}");
-        let entry_path = format!("{served_root}/{}", entry.as_deref().unwrap_or("index.html"));
+        let tag = format!("{SERVED_PREFIX}{id}");
         let origin = (!local).then(|| Origin {
             port,
-            served_root: served_root.clone(),
-            entry_path: entry_path.clone(),
-            entry_is_root: !explicit,
+            tag: tag.clone(),
         });
         self.entries.lock().unwrap().insert(
             id.clone(),
@@ -419,15 +442,15 @@ impl Daemon {
             },
         );
         if !local {
-            let mut body = json!({ "servedRoot": served_root, "entryPath": entry_path, "allowLive": dir.is_none() });
+            let path = entry.as_deref().map_or_else(|| "/".into(), safe::url_path);
+            let mut body = json!({ "entry": path, "tag": tag });
             if bridged {
                 body["bridge"] = json!(true);
                 body["maxTabs"] = json!(max_tabs);
                 body["quiet"] = json!(quiet);
-                body["webhookId"] = json!(format!("scserve-{id}"));
             }
             match self.mint(&body) {
-                Ok((token, url, tray_id)) => {
+                Ok((token, url, host_id)) => {
                     if bridged {
                         let title = dir.clone().unwrap_or_else(|| format!("127.0.0.1:{port}"));
                         self.bridge
@@ -435,8 +458,8 @@ impl Daemon {
                     }
                     record.preview_token = Some(token);
                     record.url = Some(public_url(&url, explicit));
-                    record.tray_id = Some(tray_id);
-                    record.served_root = Some(served_root);
+                    record.host_id = Some(host_id);
+                    record.tag = Some(tag);
                 }
                 Err(e) => {
                     if let Some(entry) = self.entries.lock().unwrap().remove(&id) {
@@ -456,53 +479,49 @@ impl Daemon {
     }
 
     fn mint(&self, body: &Value) -> Result<(String, String, String), HubError> {
-        let call = |tray: &Tray| {
+        let call = |host: &Host| {
             self.hub.call(
                 "POST",
-                tray::api(&self.hub, tray, "preview"),
-                Some(&tray.controller_token),
+                host::api(&self.hub, host, "previews"),
+                Some(&host.secret),
                 Payload::Json(body.clone()),
             )
         };
-        let tray = self.ensure_link()?;
-        let answer = match call(&tray) {
+        let host = self.ensure_link()?;
+        let answer = match call(&host) {
             Err(e) if e.recreates() => {
                 self.drop_link();
-                let keep = matches!(e, HubError::Gone { .. })
-                    && self.records.holds_snapshots(&tray.tray_id);
-                let fresh = self.store.replace(&self.hub, &tray, keep)?;
-                let tray = {
+                let fresh = self.store.replace(&self.hub, Some(&host))?;
+                let host = {
                     let _guard = self.connecting.lock().unwrap();
                     self.connect(fresh)?
                 };
-                call(&tray).map(|v| (v, tray))
+                call(&host).map(|v| (v, host))
             }
-            other => other.map(|v| (v, tray)),
+            other => other.map(|v| (v, host)),
         };
-        let (value, tray) = answer?;
+        let (value, host) = answer?;
         let text = |k: &str| value.get(k).and_then(Value::as_str).map(str::to_string);
         match (text("previewToken"), text("url")) {
-            (Some(token), Some(url)) => Ok((token, url, tray.tray_id)),
+            (Some(token), Some(url)) => Ok((token, url, host.host_id)),
             _ => Err(HubError::Protocol {
-                message: "the tray hub's mint answer has no previewToken or url".into(),
+                message: "the serve hub's mint answer has no previewToken or url".into(),
             }),
         }
     }
 
-    fn ensure_link(&self) -> Result<Tray, HubError> {
+    fn ensure_link(&self) -> Result<Host, HubError> {
         let _guard = self.connecting.lock().unwrap();
         if let Some(link) = self.link.lock().unwrap().as_ref() {
             if link.alive.load(Ordering::SeqCst) {
-                return Ok(link.tray.clone());
+                return Ok(link.host.clone());
             }
         }
-        let (tray, fresh) = self.store.current(&self.hub)?;
-        match self.connect(tray.clone()) {
+        let (host, fresh) = self.store.current(&self.hub)?;
+        match self.connect(host.clone()) {
             Err(e) if e.recreates() && !fresh => {
-                let keep = matches!(e, HubError::Gone { .. })
-                    && self.records.holds_snapshots(&tray.tray_id);
-                let tray = self.store.replace(&self.hub, &tray, keep)?;
-                self.connect(tray)
+                let host = self.store.replace(&self.hub, Some(&host))?;
+                self.connect(host)
             }
             other => other,
         }
@@ -514,13 +533,15 @@ impl Daemon {
         }
     }
 
-    fn connect(&self, tray: Tray) -> Result<Tray, HubError> {
-        let (tray, url) = tray::claim(&self.hub, &tray)?;
-        self.store.remember(&tray);
-        let socket = ws::connect(&self.hub, &url)?;
+    fn connect(&self, host: Host) -> Result<Host, HubError> {
+        let socket = ws::connect(&self.hub, &host::socket_url(&self.hub, &host), &host.secret)?;
         let (out, rx) = channel();
+        let conn = Arc::new(Conn {
+            out: out.clone(),
+            streams: Mutex::new(HashMap::new()),
+        });
         self.bridge.relinking();
-        self.bridge.set_hub(out.clone());
+        self.bridge.set_hub(out);
         let me = self.self_arc();
         std::thread::spawn(move || {
             std::thread::sleep(RELINK);
@@ -531,31 +552,46 @@ impl Daemon {
         let alive = Arc::new(AtomicBool::new(true));
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let previous = self.link.lock().unwrap().replace(Link {
-            tray: tray.clone(),
+            host: host.clone(),
             alive: alive.clone(),
         });
         if let Some(previous) = previous {
             previous.alive.store(false, Ordering::SeqCst);
         }
-        eprintln!("{NAME} relay: leading tray {}", tray.tray_id);
+        self.orphan(&host.host_id, "the serve hub dropped this machine's host");
+        eprintln!("{NAME} relay: publishing for host {}", host.host_id);
         let me = self.self_arc();
-        let t = tray.clone();
-        std::thread::spawn(move || me.pump(socket, rx, out, alive, t, generation));
+        let h = host.clone();
+        std::thread::spawn(move || me.pump(socket, rx, conn, alive, h, generation));
         let me = self.self_arc();
-        let t = tray.clone();
-        std::thread::spawn(move || me.tidy(&t));
-        Ok(tray)
+        let h = host.clone();
+        std::thread::spawn(move || me.tidy(&h));
+        Ok(host)
     }
 
     fn self_arc(&self) -> Arc<Daemon> {
         self.me.upgrade().expect("the daemon outlives its threads")
     }
 
-    fn tidy(&self, tray: &Tray) {
+    fn orphan(&self, current: &str, reason: &str) {
+        let ids: Vec<String> = self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| e.record.host_id.as_deref().is_some_and(|h| h != current))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            self.stop(&id, reason, false);
+        }
+    }
+
+    fn tidy(&self, host: &Host) {
         let Ok(list) = self.hub.call(
             "GET",
-            tray::api(&self.hub, tray, "previews"),
-            Some(&tray.controller_token),
+            host::api(&self.hub, host, "previews"),
+            Some(&host.secret),
             Payload::None,
         ) else {
             return;
@@ -565,7 +601,7 @@ impl Daemon {
             .lock()
             .unwrap()
             .values()
-            .filter_map(|e| e.origin.as_ref().map(|o| o.served_root.clone()))
+            .filter_map(|e| e.origin.as_ref().map(|o| o.tag.clone()))
             .collect();
         for preview in list
             .get("previews")
@@ -573,60 +609,56 @@ impl Daemon {
             .into_iter()
             .flatten()
         {
-            let mode = preview
-                .get("mode")
-                .and_then(Value::as_str)
-                .unwrap_or("live");
-            let root = preview
-                .get("servedRoot")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let token = preview.get("previewToken").and_then(Value::as_str);
-            if mode == "persistent" || served.iter().any(|s| s == root) {
+            let text = |k: &str| preview.get(k).and_then(Value::as_str).unwrap_or("");
+            if text("mode") != "live" || served.iter().any(|s| s == text("tag")) {
                 continue;
             }
-            if let Some(token) = token {
-                eprintln!("{NAME} relay: revoking {token}, which nothing serves any more");
-                let _ = self.hub.call(
-                    "POST",
-                    tray::api(&self.hub, tray, "preview/stop"),
-                    Some(&tray.controller_token),
-                    Payload::Json(json!({ "previewToken": token })),
-                );
+            let token = text("previewToken");
+            if token.is_empty() {
+                continue;
             }
+            eprintln!("{NAME} relay: stopping {token}, which nothing serves any more");
+            let _ = self.hub.call(
+                "DELETE",
+                host::api(&self.hub, host, &format!("previews/{token}")),
+                Some(&host.secret),
+                Payload::None,
+            );
         }
     }
 
     fn pump(
         self: Arc<Self>,
         mut socket: ws::Socket,
-        rx: Receiver<String>,
-        out: Sender<String>,
+        rx: Receiver<Message>,
+        conn: Arc<Conn>,
         alive: Arc<AtomicBool>,
-        tray: Tray,
+        host: Host,
         generation: u64,
     ) {
         let mut pinged = Instant::now();
         let mut broken = false;
+        let mut closed: Option<u16> = None;
         while alive.load(Ordering::SeqCst) && !broken {
-            while let Ok(text) = rx.try_recv() {
-                if socket.send(Message::text(text)).is_err() {
+            while let Ok(message) = rx.try_recv() {
+                if socket.send(message).is_err() {
                     broken = true;
                     break;
                 }
             }
             if pinged.elapsed() > PING {
                 pinged = Instant::now();
-                if socket
-                    .send(Message::text(json!({"type": "ping"}).to_string()))
-                    .is_err()
-                {
+                if socket.send(Message::text("ping")).is_err() {
                     broken = true;
                 }
             }
             match socket.read() {
-                Ok(Message::Text(text)) => self.dispatch(text.as_str(), &out),
-                Ok(Message::Close(_)) => broken = true,
+                Ok(Message::Text(text)) => self.dispatch(text.as_str(), &conn),
+                Ok(Message::Binary(data)) => self.body(&data, &conn),
+                Ok(Message::Close(frame)) => {
+                    closed = frame.map(|f| u16::from(f.code));
+                    broken = true;
+                }
                 Ok(_) => {}
                 Err(tungstenite::Error::Io(e))
                     if matches!(
@@ -639,11 +671,30 @@ impl Daemon {
         let _ = socket.close(None);
         let _ = socket.flush();
         alive.store(false, Ordering::SeqCst);
+        conn.cancel_all();
         if !broken || self.generation.load(Ordering::SeqCst) != generation {
             return;
         }
-        eprintln!("{NAME} relay: lost the tray hub, reconnecting");
-        self.reconnect(tray, generation);
+        match closed {
+            Some(4000) => {
+                eprintln!(
+                    "{NAME} relay: another socket took over host {}",
+                    host.host_id
+                );
+                self.drop_link();
+                self.stop_public("another scserve took over this machine's host");
+            }
+            Some(4001) => {
+                eprintln!("{NAME} relay: the serve hub deleted host {}", host.host_id);
+                self.drop_link();
+                self.store.forget(&host.host_id);
+                self.stop_public("the serve hub deleted this machine's host");
+            }
+            _ => {
+                eprintln!("{NAME} relay: lost the serve hub, reconnecting");
+                self.reconnect(host, generation);
+            }
+        }
     }
 
     fn public_entries(&self) -> bool {
@@ -654,7 +705,21 @@ impl Daemon {
             .any(|e| e.origin.is_some())
     }
 
-    fn reconnect(&self, tray: Tray, generation: u64) {
+    fn stop_public(&self, reason: &str) {
+        let ids: Vec<String> = self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| e.origin.is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            self.stop(&id, reason, false);
+        }
+    }
+
+    fn reconnect(&self, host: Host, generation: u64) {
         for attempt in 0.. {
             let delay = RECONNECT[attempt.min(RECONNECT.len() - 1)];
             std::thread::sleep(Duration::from_secs(delay));
@@ -669,28 +734,12 @@ impl Daemon {
             if self.generation.load(Ordering::SeqCst) != generation {
                 return;
             }
-            let latest = self
-                .store
-                .load()
-                .find(&tray.tray_id)
-                .cloned()
-                .unwrap_or(tray.clone());
-            match self.connect(latest) {
+            match self.connect(host.clone()) {
                 Ok(_) => return,
                 Err(e) if e.recreates() => {
-                    eprintln!("{NAME} relay: the tray hub dropped tray {}", tray.tray_id);
+                    eprintln!("{NAME} relay: the serve hub dropped host {}", host.host_id);
                     self.drop_link();
-                    let ids: Vec<String> = self
-                        .entries
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|(_, e)| e.origin.is_some())
-                        .map(|(id, _)| id.clone())
-                        .collect();
-                    for id in ids {
-                        self.stop(&id, "the tray hub dropped this machine's tray", false);
-                    }
+                    self.stop_public("the serve hub dropped this machine's host");
                     return;
                 }
                 Err(e) => {
@@ -702,39 +751,74 @@ impl Daemon {
         }
     }
 
-    fn dispatch(&self, text: &str, out: &Sender<String>) {
+    fn body(&self, data: &[u8], conn: &Conn) {
+        let Some((id, bytes)) = relay::unframe(data) else {
+            return;
+        };
+        let pushed = conn.stream(id).is_some_and(|s| s.push(bytes));
+        if !pushed {
+            conn.text(json!({ "type": "http.ack", "id": id, "bytes": bytes.len() }));
+        }
+    }
+
+    fn request(&self, message: &Value, conn: &Arc<Conn>) {
+        let Some(request) = relay::parse(message) else {
+            return;
+        };
+        let (port, holder) = {
+            let entries = self.entries.lock().unwrap();
+            let found = entries
+                .values()
+                .find(|e| e.record.preview_token.as_deref() == Some(&request.preview_token));
+            (
+                found.and_then(|e| e.origin.as_ref().map(|o| o.port)),
+                found.and_then(|e| e.holder.as_ref().and_then(|h| h.try_clone().ok())),
+            )
+        };
+        let stream = Arc::new(Stream::new(request.body));
+        conn.streams
+            .lock()
+            .unwrap()
+            .insert(request.id, stream.clone());
+        let conn = conn.clone();
+        std::thread::spawn(move || {
+            let outcome = relay::serve(&request, port, &stream, &conn.out);
+            conn.streams.lock().unwrap().remove(&request.id);
+            if let (Some(mut holder), true) = (holder, outcome.status > 0) {
+                let log = format!(
+                    "{} {} {} {}",
+                    request.method, request.path, outcome.status, outcome.bytes
+                );
+                line(&mut holder, &json!({ "log": log }));
+            }
+        });
+    }
+
+    fn dispatch(&self, text: &str, conn: &Arc<Conn>) {
         let Ok(message) = serde_json::from_str::<Value>(text) else {
             return;
         };
+        let id = message
+            .get("id")
+            .and_then(Value::as_u64)
+            .and_then(|i| u32::try_from(i).ok());
+        let stream = || id.and_then(|i| conn.stream(i));
         match message.get("type").and_then(Value::as_str) {
-            Some("preview.request") => {
-                let Some(request) = relay::parse(&message) else {
-                    return;
-                };
-                let (origin, holder) = {
-                    let entries = self.entries.lock().unwrap();
-                    let found = entries.values().find(|e| {
-                        e.origin
-                            .as_ref()
-                            .is_some_and(|o| o.served_root == request.served_root)
-                    });
-                    (
-                        found.and_then(|e| e.origin.clone()),
-                        found.and_then(|e| e.holder.as_ref().and_then(|h| h.try_clone().ok())),
-                    )
-                };
-                let out = out.clone();
-                let agent = self.agent.clone();
-                std::thread::spawn(move || {
-                    let answer = relay::answer(&request, origin.as_ref(), &agent);
-                    for m in &answer.messages {
-                        let _ = out.send(m.to_string());
-                    }
-                    if let Some(mut holder) = holder {
-                        let log = format!("GET {} {} {}", answer.path, answer.status, answer.bytes);
-                        line(&mut holder, &json!({ "log": log }));
-                    }
-                });
+            Some("http.request") => self.request(&message, conn),
+            Some("http.request.end") => {
+                if let Some(s) = stream() {
+                    s.end();
+                }
+            }
+            Some("http.ack") => {
+                if let Some(s) = stream() {
+                    s.ack(message.get("bytes").and_then(Value::as_u64).unwrap_or(0));
+                }
+            }
+            Some("http.cancel") => {
+                if let Some(s) = id.and_then(|i| conn.streams.lock().unwrap().remove(&i)) {
+                    s.cancel();
+                }
             }
             Some("bridge.connected") => {
                 if let Some(ev) = self.bridge.connected(&message) {
@@ -746,12 +830,8 @@ impl Daemon {
                     self.tell(&ev);
                 }
             }
-            Some("webhook.event") => {
-                let ours = message
-                    .get("webhookId")
-                    .and_then(Value::as_str)
-                    .is_some_and(|w| w.starts_with("scserve-"));
-                if let Some(ev) = ours.then(|| self.bridge.emitted(&message)).flatten() {
+            Some("bridge.emit") => {
+                if let Some(ev) = self.bridge.emitted(&message) {
                     self.tell(&ev);
                 }
             }
@@ -770,7 +850,7 @@ impl Daemon {
                     .find(|(_, e)| e.record.preview_token.as_deref() == Some(token))
                     .map(|(id, _)| id.clone());
                 if let Some(id) = id {
-                    self.stop(&id, "revoked on the tray hub", false);
+                    self.stop(&id, "stopped on the serve hub", false);
                 }
             }
             _ => {}
@@ -802,19 +882,19 @@ impl Daemon {
         if let Some(server) = &entry.server {
             server.stop();
         }
-        if let (true, Some(token), Some(tray_id)) = (
+        if let (true, Some(token), Some(host)) = (
             revoke,
             entry.record.preview_token.as_deref(),
-            entry.record.tray_id.as_deref(),
+            self.store
+                .saved(&self.hub)
+                .filter(|h| entry.record.host_id.as_deref() == Some(h.host_id.as_str())),
         ) {
-            if let Some(tray) = self.store.load().find(tray_id).cloned() {
-                let _ = self.hub.call(
-                    "POST",
-                    tray::api(&self.hub, &tray, "preview/stop"),
-                    Some(&tray.controller_token),
-                    Payload::Json(json!({ "previewToken": token })),
-                );
-            }
+            let _ = self.hub.call(
+                "DELETE",
+                host::api(&self.hub, &host, &format!("previews/{token}")),
+                Some(&host.secret),
+                Payload::None,
+            );
         }
         self.records.remove(id);
         if let Some(mut holder) = entry.holder {

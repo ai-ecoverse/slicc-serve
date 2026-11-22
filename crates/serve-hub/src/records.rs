@@ -42,13 +42,4 @@ impl Records {
     pub fn find(&self, target: &str) -> Found {
         record::find(self.all(), target)
     }
-
-    pub fn holds_snapshots(&self, tray_id: &str) -> bool {
-        let now = serve_core::time::iso(serve_core::time::now_ms());
-        self.all().iter().any(|r| {
-            r.mode == "persistent"
-                && r.tray_id.as_deref() == Some(tray_id)
-                && r.expires_at.as_deref().is_none_or(|e| e > now.as_str())
-        })
-    }
 }

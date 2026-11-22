@@ -114,12 +114,13 @@ test('a bridged tab keeps its target id across a relay reconnect, and a tab gone
   const other = await hub.tab(out.url, { origin: new URL(out.url).origin });
   const second = `preview:${out.previewToken}:${other.connId}`;
   await eventually(async () => (await (await fetch(`${out.cdpUrl}json/list`)).json()).length === 2);
-  const tray = hub.trays.get(box.tray().current.trayId);
-  const before = hub.hits('POST', /^\/controller\//);
-  tray.socket.close();
-  await eventually(() => !tray.socket);
+  const host = hub.hosts.get(box.host().hostId);
+  const path = `/api/serve/host/${host.hostId}/ws`;
+  const before = hub.hits('GET', path);
+  host.socket.close();
+  await eventually(() => !host.socket);
   other.close();
-  await eventually(() => hub.hits('POST', /^\/controller\//) > before && tray.socket, 20_000);
+  await eventually(() => hub.hits('GET', path) > before && host.socket, 20_000);
   const ids = await eventually(async () => {
     const list = await (await fetch(`${out.cdpUrl}json/list`)).json();
     return list.length === 1 && list.map((t) => t.id);

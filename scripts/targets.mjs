@@ -59,7 +59,7 @@ export function mainManifest(version, platforms) {
     name: NAME,
     version,
     description:
-      'serve and scserve: publish a directory or a local server at a public capability URL through the SLICC tray hub, on any host and inside SLICC',
+      'serve and scserve: publish a directory or a local server at a public capability URL through the SLICC serve hub, on any host and inside SLICC',
     license: 'Apache-2.0',
     repository: { type: 'git', url: 'git+https://github.com/ai-ecoverse/slicc-serve.git' },
     homepage: 'https://github.com/ai-ecoverse/slicc-serve#readme',

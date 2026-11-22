@@ -66,7 +66,7 @@ fn run(cmd: &str, dir: &str, ttl_ms: u64, opts: &Serve) -> Result<(Record, usize
         url: Some(public_url(&url, opts.entry.is_some())),
         root: Some(dir.to_string()),
         entry: opts.entry.clone(),
-        tray_id: text("trayId"),
+        host_id: text("hostId"),
         created_at: time::iso(now),
         expires_at: Some(time::iso(expires)),
         ..Record::default()

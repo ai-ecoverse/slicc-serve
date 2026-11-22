@@ -14,10 +14,9 @@ pub mod token;
 
 pub const NAME: &str = "scserve";
 pub const PACKAGE: &str = "@ai-ecoverse/slicc-serve";
-pub const DEFAULT_HUB: &str = "https://www.sliccy.ai";
+pub const DEFAULT_HUB: &str = "https://seven.sliccy.ai";
 pub const SERVED_PREFIX: &str = "/srv/serve/";
 pub const MAX_FILE_BYTES: u64 = 25 * 1024 * 1024;
-pub const MAX_RANGE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_SNAPSHOT_FILES: usize = 1_000;
 pub const MAX_SNAPSHOT_DIRS: usize = 10_000;
 pub const MAX_SNAPSHOT_BYTES: u64 = 50 * 1024 * 1024;

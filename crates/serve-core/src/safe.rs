@@ -1,19 +1,5 @@
 use std::path::{Path, PathBuf};
 
-pub fn within_served_root(vfs_path: &str, served_root: &str) -> bool {
-    if vfs_path.is_empty() || served_root.is_empty() || served_root == "/" {
-        return false;
-    }
-    if !vfs_path.starts_with('/') || vfs_path.to_ascii_lowercase().contains("%2e") {
-        return false;
-    }
-    if vfs_path.split('/').any(|s| s == "." || s == "..") {
-        return false;
-    }
-    let root = served_root.strip_suffix('/').unwrap_or(served_root);
-    vfs_path == root || vfs_path.starts_with(&format!("{root}/"))
-}
-
 pub fn percent_decode(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -29,6 +15,11 @@ pub fn percent_decode(raw: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+pub fn url_path(path: &str) -> String {
+    let encoded: Vec<String> = path.split('/').map(percent_encode_segment).collect();
+    format!("/{}", encoded.join("/"))
 }
 
 pub fn percent_encode_segment(segment: &str) -> String {
