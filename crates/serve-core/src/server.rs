@@ -7,7 +7,10 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use wasix_net::{TcpListener, TcpStream};
+use wasix_net::{Shutdown, TcpListener, TcpStream};
+
+const DISCARD: u64 = 1024 * 1024;
+const LINGER: u64 = 64 * 1024 * 1024;
 
 pub enum Body {
     Empty,
@@ -263,12 +266,59 @@ pub fn connection(mut stream: TcpStream, site: &Site, log: &Log, keep_alive: boo
                 return;
             }
         };
-        let keep = keep_alive && req.keep_alive();
+        let declared = body_length(&req);
+        let mut keep = keep_alive && req.keep_alive();
+        if declared > DISCARD {
+            keep = false;
+        } else if !discard(&mut stream, &mut carry, declared) {
+            return;
+        }
         let reply = site.handle(&req);
         let sent = write_reply(&mut stream, &reply, req.method == "HEAD", keep);
         log(&req, &reply);
         if sent.is_err() || !keep {
+            if declared > DISCARD {
+                linger(&mut stream);
+            }
             return;
+        }
+    }
+}
+
+pub fn body_length(req: &Request) -> u64 {
+    if req.header("transfer-encoding").is_some() {
+        return u64::MAX;
+    }
+    match req.header("content-length") {
+        Some(len) => len.trim().parse().unwrap_or(u64::MAX),
+        None => 0,
+    }
+}
+
+fn discard(stream: &mut TcpStream, carry: &mut Vec<u8>, len: u64) -> bool {
+    let held = carry.len().min(usize::try_from(len).unwrap_or(usize::MAX));
+    carry.drain(..held);
+    let mut rest = len - held as u64;
+    let mut buf = [0u8; 8192];
+    while rest > 0 {
+        let want = buf.len().min(usize::try_from(rest).unwrap_or(buf.len()));
+        match stream.read(&mut buf[..want]) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => rest -= n as u64,
+        }
+    }
+    true
+}
+
+fn linger(stream: &mut TcpStream) {
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let mut buf = [0u8; 8192];
+    let mut read = 0u64;
+    while read < LINGER {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => read += n as u64,
         }
     }
 }

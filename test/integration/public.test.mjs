@@ -164,6 +164,10 @@ test('--port relays the whole request: method, query, headers and body, and the 
       res.writeHead(302, { location: `http://127.0.0.1:${app.address().port}/new?from=old` });
       return res.end();
     }
+    if (req.url === '/net') {
+      res.writeHead(303, { location: `//localhost:${app.address().port}/login` });
+      return res.end();
+    }
     if (req.url === '/away') {
       res.writeHead(301, { location: 'https://example.com/elsewhere' });
       return res.end();
@@ -225,6 +229,9 @@ test('--port relays the whole request: method, query, headers and body, and the 
   const old = await hub.visit(new URL('old', out.url).href);
   assert.equal(old.status, 302);
   assert.equal(old.headers.location, '/new?from=old');
+  const net = await hub.visit(new URL('net', out.url).href);
+  assert.equal(net.status, 303);
+  assert.equal(net.headers.location, '/login');
   const away = await hub.visit(new URL('away', out.url).href);
   assert.equal(away.status, 301);
   assert.equal(away.headers.location, 'https://example.com/elsewhere');
@@ -442,4 +449,52 @@ test("a relay of an older scserve for six's hub is named, not used", async () =>
     'scserve: a relay for https://www.sliccy.ai (pid 4242, likely an older scserve) still runs; its previews end when it stops (kill 4242)\n'
   );
   writeFileSync(join(box.stateDir, 'relay.json'), '{}');
+});
+
+test('an origin that answers a large upload early reaches the visitor at once', async () => {
+  const box = sandbox(hub);
+  const early = createTcp((sock) => {
+    let head = '';
+    sock.on('data', (chunk) => {
+      if (head.includes('\r\n\r\n')) return;
+      head += chunk.toString('latin1');
+      if (!head.includes('\r\n\r\n')) return;
+      sock.pause();
+      sock.write(
+        'HTTP/1.1 413 Too Large\r\ncontent-length: 8\r\nconnection: close\r\n\r\ntoo big\n'
+      );
+      setTimeout(() => sock.destroy(), 5_000).unref();
+    });
+  });
+  await new Promise((r) => early.listen(0, '127.0.0.1', r));
+  after(() => early.close());
+  const res = await box.run(['--port', String(early.address().port)]);
+  assert.equal(res.code, 0, res.stderr);
+  const started = Date.now();
+  const answer = await hub.visit(
+    new URL('upload', res.stdout.trim()).href,
+    { 'content-type': 'application/octet-stream' },
+    { method: 'POST', body: Buffer.alloc(16 * 1024 * 1024, 1) }
+  );
+  assert.equal(answer.status, 413);
+  assert.equal(answer.body.toString(), 'too big\n');
+  assert.ok(Date.now() - started < 4_000, String(Date.now() - started));
+});
+
+test('--local goes to a running relay of another serve hub', async () => {
+  const box = sandbox(hub);
+  const first = await box.run([box.site({ 'index.html': 'a' }, 'a')]);
+  assert.equal(first.code, 0, first.stderr);
+  const other = await fakeHub();
+  after(() => other.close());
+  const local = await box.run(['--local', box.site({ 'index.html': 'b' }, 'b')], {
+    SLICC_SERVE_HUB: other.origin,
+  });
+  assert.equal(local.code, 0, local.stderr);
+  assert.match(local.stdout, /^http:\/\/127\.0\.0\.1:\d+\/\n$/);
+  const public_ = await box.run([box.site({ 'index.html': 'c' }, 'c')], {
+    SLICC_SERVE_HUB: other.origin,
+  });
+  assert.equal(public_.code, 1);
+  assert.match(public_.stderr, new RegExp(`a relay for ${hub.origin} \\(pid \\d+`));
 });

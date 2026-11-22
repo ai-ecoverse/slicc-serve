@@ -149,9 +149,20 @@ pub fn publish(
             return Err(Failure::hub(&e, "uploading the snapshot"));
         }
     };
-    let url = text(&done, "url")
-        .or_else(|| text(&value, "url"))
-        .unwrap_or_default();
+    let Some(url) = text(&done, "url").or_else(|| text(&value, "url")) else {
+        let _ = hub.call(
+            "DELETE",
+            host::api(hub, &host, &format!("previews/{token}")),
+            Some(&host.secret),
+            Payload::None,
+        );
+        return Err(Failure::hub(
+            &HubError::Protocol {
+                message: "the serve hub's finalize answer has no url".into(),
+            },
+            "uploading the snapshot",
+        ));
+    };
     let now = time::now_ms();
     let expires = done
         .get("expiresAt")

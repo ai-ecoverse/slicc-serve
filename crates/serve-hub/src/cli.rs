@@ -480,7 +480,7 @@ fn publish(hub: &Hub, dirs: &Dirs, abs: Option<&Path>, opts: &Serve, out: Out, e
         "entry": opts.entry,
         "local": opts.local,
         "hold": opts.foreground,
-        "hub": hub.origin(),
+        "hub": (!opts.local).then(|| hub.origin()),
         "bridge": opts.bridge,
         "maxTabs": opts.max_tabs,
         "quiet": opts.quiet,

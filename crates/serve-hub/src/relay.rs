@@ -248,7 +248,10 @@ pub fn framing(method: &str, response: &Response) -> Result<Framing, String> {
 }
 
 pub fn local_location(value: &str, port: u16) -> Option<String> {
-    let url = url::Url::parse(value).ok()?;
+    let url = match value.strip_prefix("//") {
+        Some(rest) => url::Url::parse(&format!("http://{rest}")).ok()?,
+        None => url::Url::parse(value).ok()?,
+    };
     let local = matches!(url.host_str()?, "127.0.0.1" | "localhost" | "[::1]");
     if !local || url.scheme() != "http" || url.port_or_known_default() != Some(port) {
         return None;
@@ -446,7 +449,7 @@ impl Stream {
     fn next_body(&self) -> Option<Vec<u8>> {
         let mut flow = self.flow.lock().unwrap();
         loop {
-            if flow.cancelled {
+            if flow.cancelled || flow.draining {
                 return None;
             }
             if let Some(bytes) = flow.body.pop_front() {
@@ -593,16 +596,31 @@ pub fn serve(req: &Request, port: Option<u16>, stream: &Stream, out: &Sender<Mes
             bytes: 0,
         };
     }
-    if origin.write_all(&head.bytes).is_ok() && req.body {
-        write_body(req, &mut origin, head.chunked, stream, out);
-    }
-    drained(req, stream, out);
-    if stream.cancelled() {
-        return Outcome {
-            status: 0,
-            bytes: 0,
-        };
-    }
+    let wrote = origin.write_all(&head.bytes).is_ok();
+    let writer = origin.try_clone().ok();
+    std::thread::scope(|scope| {
+        if let (true, true, Some(mut w)) = (
+            wrote,
+            req.body,
+            writer.as_ref().and_then(|w| w.try_clone().ok()),
+        ) {
+            let chunked = head.chunked;
+            scope.spawn(move || write_body(req, &mut w, chunked, stream, out));
+        }
+        let outcome = answer(req, port, origin, stream, out);
+        drained(req, stream, out);
+        let _ = writer.map(|w| w.shutdown(Shutdown::Both));
+        outcome
+    })
+}
+
+fn answer(
+    req: &Request,
+    port: u16,
+    origin: TcpStream,
+    stream: &Stream,
+    out: &Sender<Message>,
+) -> Outcome {
     let mut reader = BufReader::with_capacity(CHUNK, origin);
     let response = match read_response(&mut reader) {
         Ok(r) => r,

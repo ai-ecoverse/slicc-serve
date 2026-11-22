@@ -192,6 +192,26 @@ test('a finalize without the entry file (ENTRY_MISSING) exits 1 and stops the sn
   );
 });
 
+test('a snapshot the hub finalizes without a URL is a failure, and is stopped', async () => {
+  const box = sandbox(hub);
+  const site = box.site({ 'index.html': 'x' });
+  const saved = await box.saveHost(hub);
+  const token = `${saved.hostId}-${'a'.repeat(32)}`;
+  hub.inject({ method: 'POST', path: mint, status: 201, body: { previewToken: token } });
+  hub.inject({ method: 'PUT', path: files, status: 200, body: { path: 'index.html', size: 1 } });
+  hub.inject({ method: 'POST', path: finalize, status: 200, body: { previewToken: token } });
+  const stops = hub.hits('DELETE', stop);
+  const res = await box.run(['--ttl', '1h', site]);
+  assert.equal(res.code, 1);
+  assert.equal(res.stdout, '');
+  assert.equal(
+    res.stderr,
+    "scserve: uploading the snapshot: the serve hub's finalize answer has no url\n"
+  );
+  assert.equal(hub.hits('DELETE', stop) - stops, 1);
+  assert.equal((await box.run(['--list'])).stdout, 'no previews\n');
+});
+
 test('snapshots share the saved host, and --stop of one the hub lost exits 1', async () => {
   const box = sandbox(hub);
   const site = box.site({ 'index.html': 'x' });
