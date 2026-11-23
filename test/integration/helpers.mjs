@@ -1,5 +1,4 @@
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -25,7 +24,7 @@ export function sandbox(hub) {
     TEMP: process.env.TEMP || tmpdir(),
     TMP: process.env.TMP || tmpdir(),
     TMPDIR: process.env.TMPDIR || tmpdir(),
-    ...(hub ? { SLICC_TRAY_HUB: hub.origin } : {}),
+    ...(hub ? { SLICC_SERVE_HUB: hub.origin } : {}),
   };
   const stateDir = join(dir, 'state', 'slicc', 'serve');
   const configDir = join(dir, 'config', 'slicc', 'serve');
@@ -50,24 +49,21 @@ export function sandbox(hub) {
     start(args, extra = {}) {
       return start(args, { ...env, ...extra });
     },
-    tray() {
-      const file = join(configDir, 'tray.json');
-      return existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : null;
+    host() {
+      const file = join(configDir, 'host.json');
+      return existsSync(file) ? (JSON.parse(readFileSync(file, 'utf8')).hosts?.[0] ?? null) : null;
     },
-    async saveTray(at = hub) {
-      const res = await fetch(`${at.origin}/tray`, { method: 'POST', body: '{}' });
-      const created = await res.json();
-      const tray = {
+    async saveHost(at = hub, created) {
+      created ??= await at.createHost();
+      const host = {
         hub: at.origin,
-        trayId: created.trayId,
-        controllerToken: created.capabilities.controller.token,
-        controllerUrl: created.capabilities.controller.url,
-        controllerId: randomUUID(),
+        hostId: created.hostId,
+        secret: created.secret,
         createdAt: new Date().toISOString(),
       };
       mkdirSync(configDir, { recursive: true });
-      writeFileSync(join(configDir, 'tray.json'), JSON.stringify({ current: tray, retired: [] }));
-      return tray;
+      writeFileSync(join(configDir, 'host.json'), JSON.stringify({ hosts: [host] }));
+      return host;
     },
     relay() {
       const file = join(stateDir, 'relay.json');

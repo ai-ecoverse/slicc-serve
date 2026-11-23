@@ -12,7 +12,7 @@ pub const USAGE: &str = "usage: scserve [--entry FILE] [--ttl DURATION] [--local
 
 pub const HELP: &str = "
 Serve DIRECTORY, or publish the server on 127.0.0.1:PORT, at a public
-capability URL on sliccy.now through the SLICC tray hub.
+capability URL on sliccy.now through the SLICC serve hub.
 
   DIRECTORY        serve its files with the built-in static server
   --port PORT      publish a server that already runs on 127.0.0.1:PORT
@@ -37,8 +37,8 @@ capability URL on sliccy.now through the SLICC tray hub.
   --upgrade        upgrade scserve in place
   -h, --help       print this help
 
-Exit status: 0 ok, 1 failure, 2 usage error, 3 the tray hub wants a sign-in,
-4 a quota of the tray hub is used up.
+Exit status: 0 ok, 1 failure, 2 usage error, 3 the serve hub wants a sign-in,
+4 a quota of the serve hub is used up.
 ";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

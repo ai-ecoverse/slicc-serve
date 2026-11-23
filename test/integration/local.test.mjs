@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdirSync, readdirSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
+import { connect } from 'node:net';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { alive, eventually, get, sandbox } from './helpers.mjs';
@@ -222,9 +223,9 @@ test('--stop of something unknown exits 1', async () => {
   let res = await box.run(['--stop', 'nothing']);
   assert.equal(res.code, 1);
   assert.equal(res.stderr, 'scserve: no preview matches nothing\n');
-  res = await box.run(['--stop', '00000000-0000-4000-a000-000000000000.abcdef', '--json']);
+  res = await box.run(['--stop', `${'0'.repeat(20)}-${'a'.repeat(32)}`, '--json']);
   assert.equal(res.code, 1);
-  assert.match(res.stderr, /is not a preview of this machine's trays/);
+  assert.match(res.stderr, /is not a preview of this machine's host/);
   assert.equal(JSON.parse(res.stdout).exit, 1);
 });
 
@@ -262,4 +263,35 @@ test('--stop refuses a port that matches several previews', async () => {
   assert.equal(res.code, 1);
   assert.equal(res.stderr, 'scserve: 5173 matches 2 previews; stop one by its token\n');
   assert.deepEqual(readdirSync(records).sort(), ['a1.json', 'b2.json']);
+});
+
+test('the built-in server answers a client that waits on Expect: 100-continue at once', async () => {
+  const box = sandbox();
+  const res = await box.run(['--local', box.site()]);
+  assert.equal(res.code, 0, res.stderr);
+  const { port } = new URL(res.stdout.trim());
+  const started = Date.now();
+  const answer = await new Promise((resolve, reject) => {
+    const sock = connect(Number(port), '127.0.0.1', () =>
+      sock.write('POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 5\r\nexpect: 100-continue\r\n\r\n')
+    );
+    let text = '';
+    sock.on('data', (c) => {
+      text += c.toString();
+      if (text.includes('\r\n\r\n')) {
+        sock.destroy();
+        resolve(text);
+      }
+    });
+    sock.on('error', reject);
+    sock.on('close', () => resolve(text));
+    setTimeout(() => {
+      sock.destroy();
+      resolve(text);
+    }, 10_000).unref();
+  });
+  assert.match(answer, /^HTTP\/1\.1 405 /);
+  assert.match(answer, /\r\nallow: GET, HEAD\r\n/i);
+  assert.ok(Date.now() - started < 5_000, String(Date.now() - started));
+  assert.equal((await box.run(['--stop', res.stdout.trim()])).code, 0);
 });

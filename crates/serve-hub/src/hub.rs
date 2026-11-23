@@ -6,6 +6,7 @@ use url::Url;
 
 pub const MAX_HOPS: usize = 5;
 pub const BACKOFF: [u64; 3] = [1, 2, 5];
+pub const PREVIEW_NOT_FOUND: &str = "PREVIEW_NOT_FOUND";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HubError {
@@ -25,6 +26,7 @@ pub enum HubError {
     Gone {
         status: u16,
         message: String,
+        code: Option<String>,
     },
     Client {
         status: u16,
@@ -54,7 +56,11 @@ impl HubError {
     }
 
     pub fn recreates(&self) -> bool {
-        matches!(self, HubError::Refused { .. } | HubError::Gone { .. })
+        match self {
+            HubError::Refused { .. } => true,
+            HubError::Gone { code, .. } => code.as_deref() != Some(PREVIEW_NOT_FOUND),
+            _ => false,
+        }
     }
 
     pub fn sign_in(&self) -> Option<&str> {
@@ -72,7 +78,7 @@ impl HubError {
         match self {
             HubError::SignIn { location } => {
                 lines.push(format!(
-                    "{NAME}: the tray hub wants you to sign in: {location}"
+                    "{NAME}: the serve hub wants you to sign in: {location}"
                 ));
             }
             HubError::Refused {
@@ -81,7 +87,7 @@ impl HubError {
                 login,
             } => {
                 lines.push(format!(
-                    "{NAME}: {doing}: the tray hub refused it ({status}: {message})"
+                    "{NAME}: {doing}: the serve hub refused it ({status}: {message})"
                 ));
                 if let Some(login) = login {
                     lines.push(format!("{NAME}: sign in at {login}"));
@@ -93,7 +99,7 @@ impl HubError {
                 retry_after,
             } => {
                 lines.push(format!(
-                    "{NAME}: {doing}: the tray hub's limit is reached ({status}: {message})"
+                    "{NAME}: {doing}: the serve hub's limit is reached ({status}: {message})"
                 ));
                 if let Some(after) = retry_after {
                     let after = if after.bytes().all(|b| b.is_ascii_digit()) {
@@ -104,23 +110,25 @@ impl HubError {
                     lines.push(format!("{NAME}: retry after {after}"));
                 }
             }
-            HubError::Gone { status, message }
+            HubError::Gone {
+                status, message, ..
+            }
             | HubError::Client {
                 status, message, ..
             } => {
                 lines.push(format!(
-                    "{NAME}: {doing}: the tray hub answered {status}: {message}"
+                    "{NAME}: {doing}: the serve hub answered {status}: {message}"
                 ));
             }
             HubError::Server { status, message } => lines.push(format!(
-                "{NAME}: {doing}: the tray hub answered {status} {} times: {message}",
+                "{NAME}: {doing}: the serve hub answered {status} {} times: {message}",
                 BACKOFF.len() + 1
             )),
             HubError::Network { message } => lines.push(format!(
-                "{NAME}: {doing}: the tray hub is unreachable: {message}"
+                "{NAME}: {doing}: the serve hub is unreachable: {message}"
             )),
             HubError::Redirects => lines.push(format!(
-                "{NAME}: {doing}: the tray hub redirected more than {MAX_HOPS} times"
+                "{NAME}: {doing}: the serve hub redirected more than {MAX_HOPS} times"
             )),
             HubError::Protocol { message } => lines.push(format!("{NAME}: {doing}: {message}")),
         }
@@ -172,7 +180,7 @@ pub fn same_origin(a: &Url, b: &Url) -> bool {
 }
 
 pub fn api_path(path: &str) -> bool {
-    path == "/tray" || path.starts_with("/api/") || path.starts_with("/controller/")
+    path.starts_with("/api/")
 }
 
 pub fn classify(base: &Url, current: &Url, raw: &Raw) -> Step {
@@ -182,12 +190,12 @@ pub fn classify(base: &Url, current: &Url, raw: &Raw) -> Step {
         300..=399 => {
             let Some(location) = raw.location.as_deref() else {
                 return Step::Fail(HubError::Protocol {
-                    message: format!("the tray hub answered {status} without a Location"),
+                    message: format!("the serve hub answered {status} without a Location"),
                 });
             };
             let Ok(target) = current.join(location) else {
                 return Step::Fail(HubError::Protocol {
-                    message: format!("the tray hub redirected to an invalid URL: {location}"),
+                    message: format!("the serve hub redirected to an invalid URL: {location}"),
                 });
             };
             if same_origin(&target, base) && api_path(target.path()) {
@@ -211,6 +219,7 @@ pub fn classify(base: &Url, current: &Url, raw: &Raw) -> Step {
         404 | 410 => Step::Fail(HubError::Gone {
             status,
             message: message(raw),
+            code: code(raw),
         }),
         400..=499 => Step::Fail(HubError::Client {
             status,
@@ -222,7 +231,7 @@ pub fn classify(base: &Url, current: &Url, raw: &Raw) -> Step {
             message: message(raw),
         }),
         _ => Step::Fail(HubError::Protocol {
-            message: format!("the tray hub answered {status}"),
+            message: format!("the serve hub answered {status}"),
         }),
     }
 }
@@ -237,31 +246,6 @@ pub fn message(raw: &Raw) -> String {
         let text = |k: &str| json.get(k).and_then(Value::as_str).map(str::to_string);
         let error = text("error").or_else(|| text("message"));
         let code = text("code");
-        let counted = json
-            .get("active")
-            .and_then(Value::as_u64)
-            .zip(json.get("limit").and_then(Value::as_u64));
-        match code.as_deref() {
-            Some("LIVE_PREVIEW_LIMIT") => {
-                let usage = counted
-                    .map(|(a, l)| format!(" ({a} of {l} live previews in use)"))
-                    .unwrap_or_default();
-                return format!(
-                    "{}{usage}; list them with `{NAME} --list` and stop the ones you no longer need with `{NAME} --stop <token>`",
-                    error.unwrap_or_else(|| "Too many live previews".into())
-                );
-            }
-            Some("PREVIEW_LIMIT") => {
-                let usage = counted
-                    .map(|(a, l)| format!(" ({a} of {l} --ttl snapshots in use)"))
-                    .unwrap_or_default();
-                return format!(
-                    "{}{usage}; list them with `{NAME} --list` and free one with `{NAME} --stop <token>`",
-                    error.unwrap_or_else(|| "Snapshot limit reached".into())
-                );
-            }
-            _ => {}
-        }
         match (error, code) {
             (Some(e), Some(c)) => return format!("{e} ({c})"),
             (Some(e), None) => return e,
@@ -323,9 +307,10 @@ pub fn origin_of(url: &Url) -> String {
 
 impl Hub {
     pub fn new(base: &str) -> Result<Hub, String> {
-        let mut base = Url::parse(base).map_err(|e| format!("invalid tray hub URL {base}: {e}"))?;
+        let mut base =
+            Url::parse(base).map_err(|e| format!("invalid serve hub URL {base}: {e}"))?;
         if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
-            return Err(format!("invalid tray hub URL {base}"));
+            return Err(format!("invalid serve hub URL {base}"));
         }
         base.set_path("/");
         base.set_query(None);
@@ -353,18 +338,6 @@ impl Hub {
 
     pub fn url(&self, path: &str) -> Url {
         self.base.join(path).unwrap_or_else(|_| self.base.clone())
-    }
-
-    pub fn here(&self, absolute: &str) -> Url {
-        match Url::parse(absolute) {
-            Ok(u) => {
-                let mut at = self.base.clone();
-                at.set_path(u.path());
-                at.set_query(u.query());
-                at
-            }
-            Err(_) => self.url(absolute),
-        }
     }
 
     pub fn call(

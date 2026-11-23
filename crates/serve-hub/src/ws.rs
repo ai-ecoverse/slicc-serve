@@ -1,4 +1,4 @@
-use crate::hub::{classify, Hub, HubError, Raw, Step, MAX_HOPS};
+use crate::hub::{classify, same_origin, Hub, HubError, Raw, Step, MAX_HOPS};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 use tungstenite::client::IntoClientRequest;
@@ -41,7 +41,7 @@ enum Opened {
     Failed(String),
 }
 
-fn open(url: &Url) -> Opened {
+fn open(url: &Url, bearer: Option<&str>) -> Opened {
     let Some(host) = url.host_str() else {
         return Opened::Failed("no host".into());
     };
@@ -73,6 +73,9 @@ fn open(url: &Url) -> Opened {
     if let Ok(agent) = format!("{}/{}", serve_core::NAME, serve_core::version()).parse() {
         request.headers_mut().insert("user-agent", agent);
     }
+    if let Some(value) = bearer.and_then(|b| format!("Bearer {b}").parse().ok()) {
+        request.headers_mut().insert("authorization", value);
+    }
     match tungstenite::client_tls_with_config(request, stream, None, None) {
         Ok((socket, _)) => Opened::Socket(Box::new(socket)),
         Err(HandshakeError::Failure(tungstenite::Error::Http(response))) => {
@@ -85,14 +88,15 @@ fn open(url: &Url) -> Opened {
     }
 }
 
-pub fn connect(hub: &Hub, url: &str) -> Result<Socket, HubError> {
+pub fn connect(hub: &Hub, url: &str, bearer: &str) -> Result<Socket, HubError> {
     let mut url = Url::parse(url).map_err(|e| HubError::Protocol {
-        message: format!("the tray hub gave an invalid WebSocket URL: {e}"),
+        message: format!("the serve hub gave an invalid WebSocket URL: {e}"),
     })?;
     let mut hops = 0;
     let mut attempt = 0;
     loop {
-        let (error, retry) = match open(&url) {
+        let bearer = same_origin(&http_twin(&url), &hub.base).then_some(bearer);
+        let (error, retry) = match open(&url, bearer) {
             Opened::Socket(socket) => {
                 let _ = tcp(&socket).set_read_timeout(Some(Duration::from_millis(25)));
                 return Ok(*socket);
@@ -101,7 +105,7 @@ pub fn connect(hub: &Hub, url: &str) -> Result<Socket, HubError> {
                 Step::Done => (
                     HubError::Protocol {
                         message: format!(
-                            "the tray hub answered the WebSocket upgrade with {}",
+                            "the serve hub answered the WebSocket upgrade with {}",
                             raw.status
                         ),
                     },

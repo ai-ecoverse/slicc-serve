@@ -14,7 +14,7 @@ const hint =
 const PATH = /^(?!\/)(?:(?!\.\.?(?:\/|$))(?!\.(?!well-known(?:\/|$)))[^/\\:\0]+(?:\/|$))+$/;
 const page = { calls: [], refuse: undefined, hold: undefined, snapshots: new Map(), seen: [] };
 let hub;
-let tray;
+let host;
 
 function refusal(name, message) {
   return Object.assign(new Error(message), { name });
@@ -88,19 +88,19 @@ function failed(answer, extra) {
 async function snapshot(request) {
   const { options, signal } = request;
   if (page.refuse) throw page.refuse;
-  const api = `/api/tray/${tray.trayId}`;
-  const servedRoot = `/srv/serve/${randomBytes(16).toString('hex')}`;
-  const minted = await call('POST', `${api}/preview`, tray.controllerToken, {
-    servedRoot,
-    entryPath: `${servedRoot}/${options.entry ?? 'index.html'}`,
-    allowLive: false,
+  const api = `/api/serve/host/${host.hostId}`;
+  const minted = await call('POST', `${api}/previews`, host.secret, {
+    entry:
+      options.entry === undefined
+        ? '/'
+        : `/${options.entry.split('/').map(encodeURIComponent).join('/')}`,
+    tag: `/srv/serve/${randomBytes(16).toString('hex')}`,
     ttlMs: options.ttlMs,
   });
   if (!minted.ok) return failed(minted, { during: 'mint' });
   const token = minted.json.previewToken;
   let finalized = false;
-  const stop = () =>
-    call('POST', `${api}/preview/stop`, tray.controllerToken, { previewToken: token });
+  const stop = () => call('DELETE', `${api}/previews/${token}`, host.secret);
   signal.addEventListener('abort', () => {
     if (!finalized) void stop();
   });
@@ -125,8 +125,8 @@ async function snapshot(request) {
       page.seen.push(file);
       const put = await call(
         'PUT',
-        `${api}/preview/${token}/file?path=${encodeURIComponent(file.path)}`,
-        minted.json.uploadToken,
+        `${api}/previews/${token}/files/${file.path.split('/').map(encodeURIComponent).join('/')}`,
+        host.secret,
         bytes,
         file.type
       );
@@ -145,7 +145,7 @@ async function snapshot(request) {
   }
   if (page.hold) await page.hold;
   if (signal.aborted) return '';
-  const done = await call('POST', `${api}/preview/${token}/finalize`, minted.json.uploadToken);
+  const done = await call('POST', `${api}/previews/${token}/finalize`, host.secret);
   if (!done.ok) {
     await stop();
     return failed(done, { during: 'finalize' });
@@ -153,7 +153,7 @@ async function snapshot(request) {
   finalized = true;
   const expiresAt = Date.now() + options.ttlMs;
   page.snapshots.set(token, { url: done.json.url, root: options.root, expiresAt });
-  return `${JSON.stringify({ url: done.json.url, previewToken: token, trayId: tray.trayId, expiresAt, files: paths.size, bytes: total })}\n`;
+  return `${JSON.stringify({ url: done.json.url, previewToken: token, expiresAt, files: paths.size, bytes: total })}\n`;
 }
 
 const requests = {
@@ -172,13 +172,12 @@ const requests = {
     if (request.kind === 'serve.stop') {
       const { previewToken } = request.options;
       const res = await call(
-        'POST',
-        `/api/tray/${tray.trayId}/preview/stop`,
-        tray.controllerToken,
-        { previewToken }
+        'DELETE',
+        `/api/serve/host/${host.hostId}/previews/${previewToken}`,
+        host.secret
       );
       page.snapshots.delete(previewToken);
-      if (!res.json.revoked) throw refusal('NotFoundError', 'the tray hub has no such preview');
+      if (!res.ok) throw refusal('NotFoundError', 'the serve hub has no such preview');
       return '';
     }
     return '';
@@ -190,8 +189,7 @@ let os;
 before(async () => {
   if (skip) return;
   hub = await fakeHub();
-  const created = await (await fetch(`${hub.origin}/tray`, { method: 'POST', body: '{}' })).json();
-  tray = { trayId: created.trayId, controllerToken: created.capabilities.controller.token };
+  host = await hub.createHost();
   os = await boot({ requests });
   await os.sh(
     [
@@ -220,7 +218,7 @@ beforeEach(() => {
 });
 
 const run = (argv, opts) => os.run(argv, opts);
-const live = () => hub.previews().filter((p) => p.mode === 'persistent');
+const live = () => hub.previews().filter((p) => p.mode === 'snapshot');
 
 describe('serve --ttl in a kernel with a page', { skip }, () => {
   it('hands the files to the page, which uploads and finalizes them on the hub', async () => {
@@ -325,49 +323,52 @@ describe('serve --ttl in a kernel with a page', { skip }, () => {
   it("maps the hub's failures, stopping a snapshot it minted", async () => {
     hub.inject({
       method: 'POST',
-      path: `/api/tray/${tray.trayId}/preview`,
+      path: `/api/serve/host/${host.hostId}/previews`,
       status: 429,
-      body: { error: 'Snapshot limit reached', code: 'PREVIEW_LIMIT', active: 10, limit: 10 },
+      body: { error: 'Too many snapshots', code: 'PREVIEW_LIMIT' },
     });
     assert.deepEqual(await run(['serve', '--ttl', '1h', '/w/site']), {
       status: 4,
       stdout: '',
       stderr:
-        "serve: publishing the snapshot: the tray hub's limit is reached (429: Snapshot limit reached (10 of 10 --ttl snapshots in use); list them with `serve --list` and free one with `serve --stop <token>`)\n",
+        "serve: publishing the snapshot: the serve hub's limit is reached (429: Too many snapshots (PREVIEW_LIMIT))\n",
     });
     await os.kernel.writeFile('/w/large/index.html', 'x');
     await os.kernel.writeFile('/w/large/blob.bin', randomBytes(3 << 20));
     hub.inject({
       method: 'POST',
-      path: `/api/tray/${tray.trayId}/preview`,
+      path: `/api/serve/host/${host.hostId}/previews`,
       status: 503,
       body: { error: 'down' },
     });
     const early = await run(['serve', '--ttl', '1h', '/w/large']);
     assert.equal(early.status, 1);
-    assert.equal(early.stderr, 'serve: publishing the snapshot: the tray hub answered 503: down\n');
+    assert.equal(
+      early.stderr,
+      'serve: publishing the snapshot: the serve hub answered 503: down\n'
+    );
     hub.inject({
       method: 'PUT',
-      path: /\/file$/,
+      path: /\/files\/.+$/,
       status: 400,
-      body: { error: 'invalid preview file path' },
+      body: { error: 'invalid file path', code: 'INVALID_PATH' },
     });
     const upload = await run(['serve', '--ttl', '1h', '--json', '/w/site']);
     assert.equal(upload.status, 1);
     assert.deepEqual(JSON.parse(upload.stdout).lines, [
-      'serve: uploading the snapshot: the tray hub answered 400: invalid preview file path (assets/app.js)',
+      'serve: uploading the snapshot: the serve hub answered 400: invalid file path (INVALID_PATH) (assets/app.js)',
     ]);
     hub.inject({
       method: 'POST',
       path: /\/finalize$/,
-      status: 403,
-      body: { error: 'invalid upload capability' },
+      status: 401,
+      body: { error: 'wrong or missing secret', code: 'UNAUTHORIZED' },
     });
     const final = await run(['serve', '--ttl', '1h', '/w/site']);
     assert.equal(final.status, 3);
     assert.equal(
       final.stderr,
-      'serve: uploading the snapshot: the tray hub refused it (403: invalid upload capability)\n'
+      'serve: uploading the snapshot: the serve hub refused it (401: wrong or missing secret (UNAUTHORIZED))\n'
     );
     assert.deepEqual(live(), []);
     assert.equal((await os.sh(`ls ${STATE}/previews | wc -l`)).stdout.trim(), '0');
@@ -380,10 +381,10 @@ describe('serve --ttl in a kernel with a page', { skip }, () => {
       stdout: '',
       stderr: `serve: the request to publish was dismissed\n${hint}`,
     });
-    page.refuse = refusal('NotSupportedError', "seven isn't connected to the tray hub");
+    page.refuse = refusal('NotSupportedError', "seven isn't connected to the serve hub");
     assert.equal(
       (await run(['serve', '--ttl', '1h', '/w/site'])).stderr,
-      "serve: seven isn't connected to the tray hub\n"
+      "serve: seven isn't connected to the serve hub\n"
     );
     assert.deepEqual(live(), []);
   });

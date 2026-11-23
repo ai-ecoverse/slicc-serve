@@ -18,9 +18,9 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tray_id: Option<String>,
+    pub host_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub served_root: Option<String>,
+    pub tag: Option<String>,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,

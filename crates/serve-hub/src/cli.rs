@@ -1,9 +1,9 @@
 use crate::client;
 use crate::daemon::{self, Failure};
+use crate::host::Store;
 use crate::hub::Hub;
 use crate::list::{self, Context, Stopped};
 use crate::records::Records;
-use crate::tray::Store;
 use crate::{open, ttl, upgrade};
 use serde_json::{json, Value};
 use serve_core::args::{self, Command, Serve, HELP, USAGE};
@@ -480,7 +480,7 @@ fn publish(hub: &Hub, dirs: &Dirs, abs: Option<&Path>, opts: &Serve, out: Out, e
         "entry": opts.entry,
         "local": opts.local,
         "hold": opts.foreground,
-        "hub": hub.origin(),
+        "hub": (!opts.local).then(|| hub.origin()),
         "bridge": opts.bridge,
         "maxTabs": opts.max_tabs,
         "quiet": opts.quiet,
@@ -488,9 +488,20 @@ fn publish(hub: &Hub, dirs: &Dirs, abs: Option<&Path>, opts: &Serve, out: Out, e
     let mut exchange = None;
     let mut last = String::new();
     for _ in 0..2 {
-        match client::ensure(dirs)
-            .and_then(|relay| client::send(&relay, request.clone()).map_err(|e| e.to_string()))
-        {
+        let other = |relay: &client::Relay| {
+            let theirs = relay
+                .hub
+                .as_deref()
+                .filter(|h| *h != hub.origin() && !opts.local)?;
+            Some(format!(
+                "a relay for {theirs} (pid {}, likely an older scserve) still runs; its previews end when it stops (kill {})",
+                relay.pid, relay.pid
+            ))
+        };
+        match client::ensure(dirs).and_then(|relay| match other(&relay) {
+            Some(line) => Err(line),
+            None => client::send(&relay, request.clone()).map_err(|e| e.to_string()),
+        }) {
             Ok(x) => {
                 exchange = Some(x);
                 break;

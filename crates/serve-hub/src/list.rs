@@ -1,8 +1,8 @@
 use crate::client;
 use crate::daemon::Failure;
-use crate::hub::{Hub, HubError, Payload};
+use crate::host::{self, Host, Store};
+use crate::hub::{Hub, HubError, Payload, PREVIEW_NOT_FOUND};
 use crate::records::Records;
-use crate::tray::{self, Store, Tray};
 use serde_json::{json, Value};
 use serve_core::paths::Dirs;
 use serve_core::record::{Found, Record};
@@ -32,11 +32,11 @@ pub fn sweep(ctx: &Context) {
     }
 }
 
-fn hub_list(ctx: &Context, tray: &Tray) -> Result<Vec<Value>, HubError> {
+fn hub_list(ctx: &Context, host: &Host) -> Result<Vec<Value>, HubError> {
     let value = ctx.hub.call(
         "GET",
-        tray::api(ctx.hub, tray, "previews"),
-        Some(&tray.controller_token),
+        host::api(ctx.hub, host, "previews"),
+        Some(&host.secret),
         Payload::None,
     )?;
     Ok(value
@@ -51,8 +51,8 @@ fn mode_of(preview: &Value) -> &'static str {
         preview.get("mode").and_then(Value::as_str),
         preview.get("state").and_then(Value::as_str),
     ) {
-        (Some("persistent"), Some("pending")) => "uploading",
-        (Some("persistent"), _) => "snapshot",
+        (Some("snapshot"), Some("uploading")) => "uploading",
+        (Some("snapshot"), _) => "snapshot",
         _ => "live",
     }
 }
@@ -75,39 +75,20 @@ fn row(preview: &Value, record: Option<&Record>) -> Value {
 pub fn gather(ctx: &Context) -> Result<Vec<Value>, Failure> {
     sweep(ctx);
     let records = ctx.records.all();
-    let file = ctx.store.load();
-    let origin = ctx.hub.origin();
     let mut rows = Vec::new();
     let mut seen: Vec<String> = Vec::new();
-    let current = file.current.clone().filter(|t| t.hub == origin);
-    let trays: Vec<(Tray, bool)> = current
-        .into_iter()
-        .map(|t| (t, true))
-        .chain(
-            file.retired
-                .iter()
-                .filter(|t| t.hub == origin)
-                .cloned()
-                .map(|t| (t, false)),
-        )
-        .collect();
-    for (tray, is_current) in trays {
-        let previews = match hub_list(ctx, &tray) {
+    if let Some(host) = ctx.store.saved(ctx.hub) {
+        let previews = match hub_list(ctx, &host) {
             Ok(p) => p,
             Err(e) if e.recreates() => {
-                let keep = matches!(e, HubError::Gone { .. })
-                    && ctx.records.holds_snapshots(&tray.tray_id);
-                drop_tray(ctx, &tray, is_current, keep);
-                if is_current && matches!(e, HubError::Refused { .. }) {
+                ctx.store.forget(&host.host_id);
+                if matches!(e, HubError::Refused { .. }) {
                     return Err(Failure::hub(&e, "listing previews"));
                 }
-                continue;
+                Vec::new()
             }
             Err(e) => return Err(Failure::hub(&e, "listing previews")),
         };
-        if !is_current && !previews.iter().any(|p| mode_of(p) != "live") {
-            ctx.store.forget(&tray.tray_id);
-        }
         for preview in &previews {
             let token = preview
                 .get("previewToken")
@@ -138,20 +119,6 @@ pub fn gather(ctx: &Context) -> Result<Vec<Value>, Failure> {
         }
     }
     Ok(rows)
-}
-
-fn drop_tray(ctx: &Context, tray: &Tray, is_current: bool, keep: bool) {
-    let id = tray.tray_id.clone();
-    let _ = ctx.store.update(|f| {
-        if is_current && f.current.as_ref().is_some_and(|t| t.tray_id == id) {
-            let old = f.current.take();
-            if keep {
-                f.retired.extend(old);
-            }
-        } else if !keep {
-            f.retired.retain(|t| t.tray_id != id);
-        }
-    });
 }
 
 pub enum Stopped {
@@ -194,21 +161,20 @@ pub fn stop(ctx: &Context, target: &str) -> Result<Stopped, Failure> {
             "{NAME}: no preview matches {target}"
         )));
     };
-    let file = ctx.store.load();
-    let Some(tray) = file.find(token::tray_of(&token)).cloned() else {
+    let host = ctx
+        .store
+        .saved(ctx.hub)
+        .filter(|h| h.host_id == token::host_of(&token));
+    let Some(host) = host else {
         return Err(Failure::plain(format!(
-            "{NAME}: {token} is not a preview of this machine's trays"
+            "{NAME}: {token} is not a preview of this machine's host"
         )));
     };
-    let is_current = file
-        .current
-        .as_ref()
-        .is_some_and(|t| t.tray_id == tray.tray_id);
     let answer = ctx.hub.call(
-        "POST",
-        tray::api(ctx.hub, &tray, "preview/stop"),
-        Some(&tray.controller_token),
-        Payload::Json(json!({ "previewToken": token })),
+        "DELETE",
+        host::api(ctx.hub, &host, &format!("previews/{token}")),
+        Some(&host.secret),
+        Payload::None,
     );
     for r in ctx.records.all() {
         if r.preview_token.as_deref() == Some(token.as_str()) {
@@ -216,15 +182,15 @@ pub fn stop(ctx: &Context, target: &str) -> Result<Stopped, Failure> {
         }
     }
     match answer {
-        Ok(v) if v.get("revoked") == Some(&json!(true)) => Ok(Stopped::Token(token)),
-        Ok(_) => Err(Failure::plain(format!(
-            "{NAME}: the tray hub has no preview {token} (already stopped or expired)"
+        Ok(_) => Ok(Stopped::Token(token)),
+        Err(HubError::Gone {
+            code: Some(code), ..
+        }) if code == PREVIEW_NOT_FOUND => Err(Failure::plain(format!(
+            "{NAME}: the serve hub has no preview {token} (already stopped or expired)"
         ))),
         Err(e) => {
             if e.recreates() {
-                let keep = matches!(e, HubError::Gone { .. })
-                    && ctx.records.holds_snapshots(&tray.tray_id);
-                drop_tray(ctx, &tray, is_current, keep);
+                ctx.store.forget(&host.host_id);
             }
             Err(Failure::hub(&e, "stopping the preview"))
         }

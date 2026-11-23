@@ -10,6 +10,7 @@ pub struct Relay {
     pub port: u16,
     pub token: String,
     pub pid: u32,
+    pub hub: Option<String>,
 }
 
 pub struct Exchange {
@@ -23,6 +24,7 @@ fn info(dirs: &Dirs) -> Option<Relay> {
         port: u16::try_from(v.get("port")?.as_u64()?).ok()?,
         token: v.get("token")?.as_str()?.to_string(),
         pid: u32::try_from(v.get("pid")?.as_u64()?).ok()?,
+        hub: None,
     })
 }
 
@@ -42,8 +44,13 @@ pub fn send(relay: &Relay, mut request: Value) -> std::io::Result<Exchange> {
 }
 
 pub fn find(dirs: &Dirs) -> Option<Relay> {
-    let relay = info(dirs)?;
+    let mut relay = info(dirs)?;
     let exchange = send(&relay, json!({ "op": "ping" })).ok()?;
+    relay.hub = exchange
+        .reply
+        .get("hub")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     (exchange.reply.get("ok") == Some(&json!(true))).then_some(relay)
 }
 

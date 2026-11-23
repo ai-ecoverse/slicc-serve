@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tungstenite::Message;
 
 pub const RECORDS: usize = 500;
 pub const DETAIL_CHARS: usize = 1000;
@@ -68,7 +69,7 @@ enum Shape {
 
 #[derive(Default)]
 struct State {
-    hub: Option<Sender<String>>,
+    hub: Option<Sender<Message>>,
     previews: HashMap<String, Preview>,
     tabs: BTreeMap<String, Tab>,
     clients: HashMap<u64, Client>,
@@ -238,7 +239,7 @@ impl State {
     fn to_hub(&self, message: Value) -> bool {
         self.hub
             .as_ref()
-            .is_some_and(|h| h.send(message.to_string()).is_ok())
+            .is_some_and(|h| h.send(Message::text(message.to_string())).is_ok())
     }
 
     fn attach(&mut self, client: u64, conn: &str, id: String) -> Option<String> {
@@ -394,7 +395,7 @@ impl Bridge {
         }
     }
 
-    pub fn set_hub(&self, hub: Sender<String>) {
+    pub fn set_hub(&self, hub: Sender<Message>) {
         self.state.lock().unwrap().hub = Some(hub);
     }
 
@@ -562,14 +563,14 @@ impl Bridge {
     }
 
     pub fn emitted(&self, message: &Value) -> Option<Value> {
-        let headers = message.get("headers").cloned().unwrap_or(Value::Null);
-        let token = text(&headers, "x-slicc-preview-token");
-        let conn = text(&headers, "x-slicc-preview-conn");
+        let token = text(message, "previewToken");
+        let conn = message.get("connId").and_then(Value::as_str)?.to_string();
         let mut st = self.state.lock().unwrap();
-        if !st.previews.contains_key(&token) {
+        let live = st.tabs.get(&conn).is_some_and(|t| t.token == token);
+        if !st.previews.contains_key(&token) || !live {
             return None;
         }
-        let body = message.get("body").cloned().unwrap_or(Value::Null);
+        let body = message;
         let name = match body.get("name") {
             Some(Value::String(s)) => s.chars().take(200).collect::<String>(),
             Some(other) => cut(other),
@@ -615,7 +616,7 @@ impl Bridge {
                 "announced": false,
                 "origin": tab.origin,
                 "userAgent": tab.user_agent,
-                "reason": "the tray hub no longer had it after the relay reconnected",
+                "reason": "the serve hub no longer had it after the relay reconnected",
             });
             st.record(record.clone());
             gone.push(record);
@@ -1072,7 +1073,7 @@ impl Bridge {
                 if !self.forward(&st, &conn, session, relay, &sent_method, sent_params) {
                     return Some(Err((
                         -32000,
-                        "the relay isn't connected to the tray hub".into(),
+                        "the relay isn't connected to the serve hub".into(),
                     )));
                 }
                 st.pending.insert(

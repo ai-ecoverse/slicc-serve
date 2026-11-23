@@ -101,7 +101,7 @@ test('--bridge mints with the bridge, and serves a guarded CDP endpoint on the l
   assert.equal(mint.bridge, true);
   assert.equal(mint.maxTabs, 3);
   assert.equal(mint.quiet, true);
-  assert.match(mint.webhookId, /^scserve-[0-9a-f]{16}$/);
+  assert.equal(mint.webhookId, undefined);
   assert.equal(previewOf(plain.stdout.trim()).mint.maxTabs, 20);
   assert.equal(box.relay().cdpSecret, secret);
 
@@ -262,8 +262,15 @@ test('a --foreground --bridge scserve reports connects, emits and the first visi
   await eventually(() => previewOf(record.url).announced === true);
   tab.emit('clicked', { button: 'buy', n: 2 });
   await proc.stderr(new RegExp(`scserve: emit ${tab.connId} clicked \\{"button":"buy","n":2\\}`));
+  const beacon = await hub.visit(
+    new URL('/__slicc/emit', record.url).href,
+    { 'content-type': 'text/plain' },
+    { method: 'POST', body: JSON.stringify({ t: 'emit', name: 'beacon', detail: 1 }) }
+  );
+  assert.equal(beacon.status, 204);
   tab.emit('\u001b]0;pwned\u0007', '\u009b2J');
   await proc.stderr(/scserve: emit \S+ \\u001b\]0;pwned\\u0007 "\\u009b2J"\n/);
+  assert.doesNotMatch(proc.err, /beacon/);
   assert.doesNotMatch(proc.err, /\u001b|\u0007|\u009b/);
   const again = await hub.tab(record.url, { origin: 'https://b.example', userAgent: 'UA-B' });
   await proc.stderr(new RegExp(`scserve: connected ${again.connId}`));
@@ -388,6 +395,6 @@ test('a preview without --bridge gets no bridge socket', async () => {
   const box = sandbox(hub);
   const res = await box.run([box.site()]);
   const tab = await hub.tab(res.stdout.trim());
-  assert.equal(tab.refused, 403);
+  assert.equal(tab.refused, 501);
   assert.doesNotMatch(res.stderr, /CDP/);
 });

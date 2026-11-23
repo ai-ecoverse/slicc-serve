@@ -1,355 +1,711 @@
-use serde_json::{json, Map, Value};
-use serve_core::range::{content_range, unsatisfied_size};
-use serve_core::safe::within_served_root;
-use serve_core::{mime, MAX_FILE_BYTES, MAX_RANGE_BYTES};
-use std::io::Read;
+use serde_json::{json, Value};
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::sync::mpsc::Sender;
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
+use tungstenite::Message;
 
 pub const CHUNK: usize = 64 * 1024;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Origin {
-    pub port: u16,
-    pub served_root: String,
-    pub entry_path: String,
-    pub entry_is_root: bool,
-}
+pub const WINDOW: u64 = 1024 * 1024;
+pub const MAX_HEAD: usize = 64 * 1024;
+pub const MAX_HEADERS: usize = 256;
+const CONNECT: Duration = Duration::from_secs(10);
+pub const READ: Duration = Duration::from_secs(120);
+const TICK: Duration = Duration::from_secs(1);
+const HOP: [&str; 10] = [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
-    pub req_id: String,
-    pub served_root: String,
-    pub vfs_path: String,
-    pub as_text: bool,
-    pub range: Option<String>,
+    pub id: u32,
+    pub preview_token: String,
+    pub method: String,
+    pub url: String,
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: bool,
 }
 
 pub fn parse(v: &Value) -> Option<Request> {
     let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    let headers = v
+        .get("headers")
+        .and_then(Value::as_array)?
+        .iter()
+        .map(|pair| match pair.as_array().map(Vec::as_slice) {
+            Some([Value::String(n), Value::String(v)]) => Some((n.to_ascii_lowercase(), v.clone())),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
     Some(Request {
-        req_id: text("reqId")?,
-        served_root: text("servedRoot")?,
-        vfs_path: text("vfsPath")?,
-        as_text: v.get("asText").and_then(Value::as_bool).unwrap_or(false),
-        range: text("range"),
+        id: u32::try_from(v.get("id")?.as_u64()?).ok()?,
+        preview_token: text("previewToken")?,
+        method: text("method")?,
+        url: text("url").unwrap_or_default(),
+        path: text("path")?,
+        headers,
+        body: v.get("body").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 
-pub fn origin_path(origin: &Origin, vfs_path: &str) -> String {
-    if origin.entry_is_root && vfs_path == origin.entry_path {
-        return "/".into();
-    }
-    let root = origin.served_root.trim_end_matches('/');
-    match vfs_path.strip_prefix(root) {
-        Some("") | None => "/".into(),
-        Some(rest) => rest.to_string(),
-    }
-}
-
-pub fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .proxy(None)
-        .max_redirects(0)
-        .max_redirects_will_error(false)
-        .http_status_as_error(false)
-        .accept_encoding(ureq::config::AutoHeaderValue::None)
-        .timeout_connect(Some(Duration::from_secs(5)))
-        .timeout_global(Some(Duration::from_secs(25)))
-        .build()
-        .into()
-}
-
-pub struct Answer {
-    pub messages: Vec<Value>,
-    pub status: u16,
-    pub bytes: u64,
-    pub path: String,
-}
-
-pub fn error(req_id: &str, status: u16, reason: Option<String>, size: Option<u64>) -> Value {
-    let mut v =
-        json!({ "type": "preview.response", "reqId": req_id, "ok": false, "status": status });
-    if let Some(reason) = reason {
-        v["reason"] = json!(reason);
-    }
-    if let Some(size) = size {
-        v["size"] = json!(size);
-    }
-    v
-}
-
-fn failed(
-    req: &Request,
-    path: String,
-    status: u16,
-    reason: Option<String>,
-    size: Option<u64>,
-) -> Answer {
-    Answer {
-        messages: vec![error(&req.req_id, status, reason, size)],
-        status,
-        bytes: 0,
-        path,
-    }
-}
-
-const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-pub fn base64(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
+pub fn frame(id: u32, bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 4);
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(bytes);
     out
 }
 
-fn split_text(text: &str) -> Vec<&str> {
-    let mut pieces = Vec::new();
-    let mut rest = text;
-    while rest.len() > CHUNK {
-        let mut at = CHUNK;
-        while !rest.is_char_boundary(at) {
-            at -= 1;
-        }
-        pieces.push(&rest[..at]);
-        rest = &rest[at..];
+pub fn unframe(data: &[u8]) -> Option<(u32, &[u8])> {
+    if data.len() < 5 {
+        return None;
     }
-    pieces.push(rest);
-    pieces
+    let id = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    Some((id, &data[4..]))
 }
 
-pub fn chunks(
-    req_id: &str,
-    mime: &str,
-    bytes: &[u8],
-    text: bool,
-    meta: &Map<String, Value>,
-) -> Vec<Value> {
-    let utf8 = if text {
-        std::str::from_utf8(bytes).ok()
-    } else {
-        None
+fn tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+fn token(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(tchar)
+}
+
+fn clean(value: &str) -> bool {
+    !value.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0))
+}
+
+fn forwarded_host(url: &str) -> Option<(String, String)> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let host = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
     };
-    let encoded;
-    let (pieces, encoding): (Vec<&str>, &str) = match utf8 {
-        Some(s) => (split_text(s), "utf-8"),
-        None => {
-            encoded = base64(bytes);
-            let mut pieces: Vec<&str> = encoded
-                .as_bytes()
-                .chunks(CHUNK)
-                .map(|c| std::str::from_utf8(c).unwrap_or(""))
-                .collect();
-            if pieces.is_empty() {
-                pieces.push("");
-            }
-            (pieces, "base64")
+    Some((host, parsed.scheme().to_string()))
+}
+
+pub struct Head {
+    pub bytes: Vec<u8>,
+    pub chunked: bool,
+}
+
+pub fn request_head(req: &Request, port: u16) -> Result<Head, String> {
+    if !token(&req.method) {
+        return Err(format!("invalid method {:?}", req.method));
+    }
+    if !req.path.starts_with('/') || !req.path.bytes().all(|b| (0x21..0x7f).contains(&b)) {
+        return Err(format!("invalid path {:?}", req.path));
+    }
+    let mut text = format!(
+        "{} {} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\n",
+        req.method, req.path
+    );
+    let mut length = false;
+    for (name, value) in &req.headers {
+        let skip = HOP.contains(&name.as_str())
+            || name == "x-forwarded-host"
+            || name == "x-forwarded-proto";
+        if skip || !token(name) || !clean(value) {
+            continue;
         }
-    };
-    let total = pieces.len();
-    pieces
-        .into_iter()
-        .enumerate()
-        .map(|(i, content)| {
-            let mut v = json!({
-                "type": "preview.response",
-                "reqId": req_id,
-                "ok": true,
-                "mime": mime,
-                "chunkIndex": i,
-                "totalChunks": total,
-                "content": content,
-                "encoding": encoding,
-            });
-            for (k, val) in meta {
-                v[k] = val.clone();
-            }
-            v
-        })
-        .collect()
+        length |= name == "content-length";
+        text.push_str(&format!("{name}: {value}\r\n"));
+    }
+    if let Some((host, scheme)) = forwarded_host(&req.url) {
+        text.push_str(&format!(
+            "x-forwarded-host: {host}\r\nx-forwarded-proto: {scheme}\r\n"
+        ));
+    }
+    let chunked = req.body && !length;
+    if chunked {
+        text.push_str("transfer-encoding: chunked\r\n");
+    }
+    text.push_str("connection: close\r\n\r\n");
+    Ok(Head {
+        bytes: text.into_bytes(),
+        chunked,
+    })
 }
 
-fn same_origin(port: u16, next: &url::Url) -> bool {
-    matches!(next.host_str(), Some("127.0.0.1") | Some("localhost"))
-        && next.scheme() == "http"
-        && next.port_or_known_default() == Some(port)
+#[derive(Debug, PartialEq, Eq)]
+pub struct Response {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
 }
 
-fn fetch(
-    agent: &ureq::Agent,
-    port: u16,
-    path: &str,
-    range: Option<&str>,
-) -> Result<ureq::http::Response<ureq::Body>, String> {
-    let mut target = format!("http://127.0.0.1:{port}{path}");
-    let mut hops = 0;
+fn read_line<R: BufRead>(r: &mut R, budget: &mut usize) -> Result<String, String> {
+    let mut line = Vec::new();
+    let read = r
+        .take(*budget as u64 + 1)
+        .read_until(b'\n', &mut line)
+        .map_err(|e| e.to_string())?;
+    if read == 0 {
+        return Err("it closed the connection".into());
+    }
+    if read > *budget || !line.ends_with(b"\n") {
+        return Err("its headers are too large".into());
+    }
+    *budget -= read;
+    line.pop();
+    if line.ends_with(b"\r") {
+        line.pop();
+    }
+    Ok(String::from_utf8_lossy(&line).into_owned())
+}
+
+pub fn read_response<R: BufRead>(r: &mut R) -> Result<Response, String> {
+    let mut budget = MAX_HEAD;
     loop {
-        let mut request = agent.get(&target).header("accept-encoding", "identity");
-        if let Some(range) = range {
-            request = request.header("range", range);
-        }
-        let response = request.call().map_err(|e| e.to_string())?;
-        let redirect = matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308);
-        let next = header(&response, "location")
-            .filter(|_| redirect && hops < 5)
-            .and_then(|loc| url::Url::parse(&target).ok()?.join(&loc).ok())
-            .filter(|n| same_origin(port, n));
-        match next {
-            Some(next) => {
-                target = next.to_string();
-                hops += 1;
+        let status_line = read_line(r, &mut budget)?;
+        let mut parts = status_line.splitn(3, ' ');
+        let version = parts.next().unwrap_or("");
+        let status = parts
+            .next()
+            .and_then(|s| s.parse::<u16>().ok())
+            .filter(|_| version.starts_with("HTTP/1."))
+            .ok_or_else(|| format!("it didn't answer HTTP ({status_line:?})"))?;
+        let mut headers: Vec<(String, String)> = Vec::new();
+        loop {
+            let line = read_line(r, &mut budget)?;
+            if line.is_empty() {
+                break;
             }
-            None => return Ok(response),
+            if line.starts_with([' ', '\t']) {
+                if let Some(last) = headers.last_mut() {
+                    last.1.push(' ');
+                    last.1.push_str(line.trim());
+                }
+                continue;
+            }
+            let Some((name, value)) = line.split_once(':') else {
+                return Err(format!("it sent a malformed header ({line:?})"));
+            };
+            if !token(name) {
+                return Err(format!("it sent a malformed header ({line:?})"));
+            }
+            headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
+            if headers.len() > MAX_HEADERS {
+                return Err("it sent too many headers".into());
+            }
+        }
+        match status {
+            101 => return Err("it switched protocols, which previews don't relay".into()),
+            100..=199 => continue,
+            200..=599 => return Ok(Response { status, headers }),
+            _ => return Err(format!("it answered status {status}")),
         }
     }
 }
 
-fn header(response: &ureq::http::Response<ureq::Body>, name: &str) -> Option<String> {
-    response
-        .headers()
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Framing {
+    Empty,
+    Length(u64),
+    Chunked,
+    Close,
 }
 
-pub fn answer(req: &Request, origin: Option<&Origin>, agent: &ureq::Agent) -> Answer {
-    if !within_served_root(&req.vfs_path, &req.served_root) {
-        return failed(req, req.vfs_path.clone(), 403, None, None);
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v.as_str())
+}
+
+pub fn framing(method: &str, response: &Response) -> Result<Framing, String> {
+    if method == "HEAD" || matches!(response.status, 204 | 304) {
+        return Ok(Framing::Empty);
     }
-    let Some(origin) = origin.filter(|o| o.served_root == req.served_root) else {
-        return failed(
+    if let Some(te) = header(&response.headers, "transfer-encoding") {
+        let last = te.rsplit(',').next().unwrap_or("").trim();
+        return Ok(if last.eq_ignore_ascii_case("chunked") {
+            Framing::Chunked
+        } else {
+            Framing::Close
+        });
+    }
+    match header(&response.headers, "content-length") {
+        Some(len) => len
+            .trim()
+            .parse::<u64>()
+            .map(Framing::Length)
+            .map_err(|_| format!("it sent an invalid Content-Length ({len:?})")),
+        None => Ok(Framing::Close),
+    }
+}
+
+pub fn local_location(value: &str, port: u16) -> Option<String> {
+    let url = match value.strip_prefix("//") {
+        Some(rest) => url::Url::parse(&format!("http://{rest}")).ok()?,
+        None => url::Url::parse(value).ok()?,
+    };
+    let local = matches!(url.host_str()?, "127.0.0.1" | "localhost" | "[::1]");
+    if !local || url.scheme() != "http" || url.port_or_known_default() != Some(port) {
+        return None;
+    }
+    let mut path = url.path().to_string();
+    if let Some(q) = url.query() {
+        path.push('?');
+        path.push_str(q);
+    }
+    if let Some(f) = url.fragment() {
+        path.push('#');
+        path.push_str(f);
+    }
+    Some(path)
+}
+
+pub fn response_headers(response: &Response, framing: Framing, port: u16) -> Value {
+    let pairs: Vec<Value> = response
+        .headers
+        .iter()
+        .filter(|(n, _)| {
+            !matches!(
+                n.as_str(),
+                "connection" | "keep-alive" | "transfer-encoding" | "proxy-connection"
+            ) && (n != "content-length" || framing != Framing::Chunked)
+        })
+        .map(|(n, v)| {
+            let v = match n.as_str() {
+                "location" => local_location(v, port).unwrap_or_else(|| v.clone()),
+                _ => v.clone(),
+            };
+            json!([n, v])
+        })
+        .collect();
+    Value::Array(pairs)
+}
+
+pub struct Body<R> {
+    reader: R,
+    framing: Framing,
+    left: u64,
+    done: bool,
+}
+
+impl<R: BufRead> Body<R> {
+    pub fn new(reader: R, framing: Framing) -> Body<R> {
+        let left = match framing {
+            Framing::Length(n) => n,
+            _ => 0,
+        };
+        Body {
+            reader,
+            framing,
+            left,
+            done: false,
+        }
+    }
+
+    fn chunk_size(&mut self) -> Result<u64, String> {
+        let mut budget = 4096;
+        let line = read_line(&mut self.reader, &mut budget)?;
+        let size = line.split(';').next().unwrap_or("").trim();
+        u64::from_str_radix(size, 16).map_err(|_| format!("it sent a bad chunk size ({line:?})"))
+    }
+
+    fn fill(&mut self, max: u64) -> Result<Vec<u8>, String> {
+        let mut buf = vec![0u8; usize::try_from(max.min(CHUNK as u64)).unwrap_or(CHUNK)];
+        let n = self.reader.read(&mut buf).map_err(|e| e.to_string())?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    pub fn piece(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if self.done {
+            return Ok(None);
+        }
+        match self.framing {
+            Framing::Empty => {
+                self.done = true;
+                Ok(None)
+            }
+            Framing::Close => {
+                let buf = self.fill(CHUNK as u64)?;
+                self.done = buf.is_empty();
+                Ok((!buf.is_empty()).then_some(buf))
+            }
+            Framing::Length(_) => {
+                if self.left == 0 {
+                    self.done = true;
+                    return Ok(None);
+                }
+                let buf = self.fill(self.left)?;
+                if buf.is_empty() {
+                    return Err(format!("its body ended {} bytes early", self.left));
+                }
+                self.left -= buf.len() as u64;
+                Ok(Some(buf))
+            }
+            Framing::Chunked => {
+                if self.left == 0 {
+                    let size = self.chunk_size()?;
+                    if size == 0 {
+                        let mut budget = MAX_HEAD;
+                        while !read_line(&mut self.reader, &mut budget)?.is_empty() {}
+                        self.done = true;
+                        return Ok(None);
+                    }
+                    self.left = size;
+                }
+                let buf = self.fill(self.left)?;
+                if buf.is_empty() {
+                    return Err("its chunked body ended early".into());
+                }
+                self.left -= buf.len() as u64;
+                if self.left == 0 {
+                    let mut budget = 2;
+                    if !read_line(&mut self.reader, &mut budget)?.is_empty() {
+                        return Err("its chunked body is malformed".into());
+                    }
+                }
+                Ok(Some(buf))
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct Flow {
+    acked: u64,
+    cancelled: bool,
+    draining: bool,
+    body: VecDeque<Vec<u8>>,
+    ended: bool,
+    origin: Option<TcpStream>,
+}
+
+#[derive(Default)]
+pub struct Stream {
+    flow: Mutex<Flow>,
+    changed: Condvar,
+}
+
+impl Stream {
+    pub fn new(body: bool) -> Stream {
+        let stream = Stream::default();
+        stream.flow.lock().unwrap().ended = !body;
+        stream
+    }
+
+    pub fn push(&self, bytes: &[u8]) -> bool {
+        let mut flow = self.flow.lock().unwrap();
+        if flow.draining || flow.cancelled || flow.ended {
+            return false;
+        }
+        flow.body.push_back(bytes.to_vec());
+        self.changed.notify_all();
+        true
+    }
+
+    pub fn end(&self) {
+        self.flow.lock().unwrap().ended = true;
+        self.changed.notify_all();
+    }
+
+    pub fn ack(&self, bytes: u64) {
+        self.flow.lock().unwrap().acked += bytes;
+        self.changed.notify_all();
+    }
+
+    pub fn cancel(&self) {
+        let mut flow = self.flow.lock().unwrap();
+        flow.cancelled = true;
+        if let Some(origin) = flow.origin.take() {
+            let _ = origin.shutdown(Shutdown::Both);
+        }
+        self.changed.notify_all();
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.flow.lock().unwrap().cancelled
+    }
+
+    fn drain(&self) -> u64 {
+        let mut flow = self.flow.lock().unwrap();
+        flow.draining = true;
+        flow.body.drain(..).map(|b| b.len() as u64).sum()
+    }
+
+    fn hold(&self, origin: &TcpStream) -> bool {
+        let mut flow = self.flow.lock().unwrap();
+        flow.origin = origin.try_clone().ok();
+        !flow.cancelled
+    }
+
+    fn next_body(&self) -> Option<Vec<u8>> {
+        let mut flow = self.flow.lock().unwrap();
+        loop {
+            if flow.cancelled || flow.draining {
+                return None;
+            }
+            if let Some(bytes) = flow.body.pop_front() {
+                return Some(bytes);
+            }
+            if flow.ended {
+                return None;
+            }
+            flow = self.changed.wait_timeout(flow, TICK).unwrap().0;
+        }
+    }
+
+    fn room(&self, sent: u64, more: u64) -> bool {
+        let mut flow = self.flow.lock().unwrap();
+        loop {
+            if flow.cancelled {
+                return false;
+            }
+            if sent + more <= flow.acked + WINDOW {
+                return true;
+            }
+            flow = self.changed.wait_timeout(flow, TICK).unwrap().0;
+        }
+    }
+}
+
+pub struct Outcome {
+    pub status: u16,
+    pub bytes: u64,
+}
+
+fn send(out: &Sender<Message>, value: Value) {
+    let _ = out.send(Message::text(value.to_string()));
+}
+
+fn drained(req: &Request, stream: &Stream, out: &Sender<Message>) {
+    let rest = stream.drain();
+    if rest > 0 {
+        send(
+            out,
+            json!({ "type": "http.ack", "id": req.id, "bytes": rest }),
+        );
+    }
+}
+
+fn respond(
+    req: &Request,
+    out: &Sender<Message>,
+    stream: &Stream,
+    status: u16,
+    text: &str,
+) -> Outcome {
+    drained(req, stream, out);
+    let bodied = req.method != "HEAD";
+    send(
+        out,
+        json!({
+            "type": "http.response",
+            "id": req.id,
+            "status": status,
+            "headers": [["content-type", "text/plain; charset=utf-8"], ["content-length", text.len().to_string()], ["cache-control", "no-store"]],
+            "body": bodied,
+        }),
+    );
+    if bodied {
+        let _ = out.send(Message::binary(frame(req.id, text.as_bytes())));
+        send(out, json!({ "type": "http.response.end", "id": req.id }));
+    }
+    Outcome {
+        status,
+        bytes: text.len() as u64,
+    }
+}
+
+fn cancel(req: &Request, out: &Sender<Message>, reason: &str) {
+    send(
+        out,
+        json!({ "type": "http.cancel", "id": req.id, "reason": reason }),
+    );
+}
+
+fn write_body(
+    req: &Request,
+    origin: &mut TcpStream,
+    chunked: bool,
+    stream: &Stream,
+    out: &Sender<Message>,
+) -> bool {
+    while let Some(bytes) = stream.next_body() {
+        let written = if chunked {
+            origin
+                .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
+                .and_then(|_| origin.write_all(&bytes))
+                .and_then(|_| origin.write_all(b"\r\n"))
+        } else {
+            origin.write_all(&bytes)
+        };
+        send(
+            out,
+            json!({ "type": "http.ack", "id": req.id, "bytes": bytes.len() }),
+        );
+        if written.is_err() {
+            return false;
+        }
+    }
+    if stream.cancelled() {
+        return false;
+    }
+    !chunked || origin.write_all(b"0\r\n\r\n").is_ok()
+}
+
+pub fn serve(
+    req: &Request,
+    port: Option<u16>,
+    stream: &Stream,
+    out: &Sender<Message>,
+    read: Duration,
+) -> Outcome {
+    let Some(port) = port else {
+        return respond(
             req,
-            req.vfs_path.clone(),
+            out,
+            stream,
             404,
-            Some("this preview is no longer served".into()),
-            None,
+            "this preview isn't served here any more\n",
         );
     };
-    let path = origin_path(origin, &req.vfs_path);
-    let mut response = match fetch(agent, origin.port, &path, req.range.as_deref()) {
-        Ok(r) => r,
+    let head = match request_head(req, port) {
+        Ok(head) => head,
+        Err(e) => return respond(req, out, stream, 400, &format!("{e}\n")),
+    };
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut origin = match TcpStream::connect_timeout(&addr, CONNECT) {
+        Ok(s) => s,
         Err(e) => {
-            return failed(
+            return respond(
                 req,
-                path,
+                out,
+                stream,
                 502,
-                Some(format!("nothing answers on 127.0.0.1:{}: {e}", origin.port)),
-                None,
+                &format!("nothing answers on 127.0.0.1:{port}: {e}\n"),
             )
         }
     };
-    let status = response.status().as_u16();
-    let mime =
-        header(&response, "content-type").unwrap_or_else(|| mime::for_path(&path).to_string());
-    let declared = header(&response, "content-length").and_then(|v| v.parse::<u64>().ok());
-    match status {
-        200 => {
-            if declared.is_some_and(|n| n > MAX_FILE_BYTES) {
-                return failed(req, path, 413, Some(too_large()), declared);
-            }
-            let mut body = Vec::new();
-            let read = response
-                .body_mut()
-                .as_reader()
-                .take(MAX_FILE_BYTES + 1)
-                .read_to_end(&mut body);
-            if let Err(e) = read {
-                return failed(req, path, 502, Some(e.to_string()), None);
-            }
-            if body.len() as u64 > MAX_FILE_BYTES {
-                return failed(req, path, 413, Some(too_large()), None);
-            }
-            let mut meta = Map::new();
-            meta.insert("status".into(), json!(200));
-            meta.insert("size".into(), json!(body.len()));
-            Answer {
-                messages: chunks(&req.req_id, &mime, &body, req.as_text, &meta),
-                status: 200,
-                bytes: body.len() as u64,
-                path,
-            }
-        }
-        206 => {
-            let Some((start, _, total)) = header(&response, "content-range")
-                .as_deref()
-                .and_then(content_range)
-            else {
-                return failed(
-                    req,
-                    path,
-                    502,
-                    Some("a 206 without Content-Range".into()),
-                    None,
-                );
-            };
-            let mut body = Vec::new();
-            let read = response
-                .body_mut()
-                .as_reader()
-                .take(MAX_RANGE_BYTES)
-                .read_to_end(&mut body);
-            if let Err(e) = read {
-                return failed(req, path, 502, Some(e.to_string()), None);
-            }
-            if body.is_empty() {
-                return failed(req, path, 416, None, Some(total));
-            }
-            let end = start + body.len() as u64 - 1;
-            let mut meta = Map::new();
-            meta.insert("status".into(), json!(206));
-            meta.insert("size".into(), json!(total));
-            meta.insert("range".into(), json!({ "start": start, "end": end }));
-            Answer {
-                messages: chunks(&req.req_id, &mime, &body, false, &meta),
-                status: 206,
-                bytes: body.len() as u64,
-                path,
-            }
-        }
-        416 => {
-            let size = header(&response, "content-range")
-                .as_deref()
-                .and_then(unsatisfied_size);
-            failed(req, path, 416, None, size)
-        }
-        _ => {
-            let mut body = Vec::new();
-            let _ = response
-                .body_mut()
-                .as_reader()
-                .take(4096)
-                .read_to_end(&mut body);
-            let text = String::from_utf8_lossy(&body).trim().to_string();
-            let reason = if text.is_empty() {
-                format!("the server answered {status}")
-            } else {
-                text
-            };
-            failed(req, path, status, Some(reason), None)
-        }
+    let _ = origin.set_nodelay(true);
+    let _ = origin.set_read_timeout((!req.body).then_some(read));
+    if !stream.hold(&origin) {
+        return Outcome {
+            status: 0,
+            bytes: 0,
+        };
     }
+    let wrote = origin.write_all(&head.bytes).is_ok();
+    let writer = origin.try_clone().ok();
+    std::thread::scope(|scope| {
+        if let (true, true, Some(mut w)) = (
+            wrote,
+            req.body,
+            writer.as_ref().and_then(|w| w.try_clone().ok()),
+        ) {
+            let chunked = head.chunked;
+            scope.spawn(move || {
+                write_body(req, &mut w, chunked, stream, out);
+                let _ = w.set_read_timeout(Some(read));
+            });
+        }
+        let outcome = answer(req, port, origin, stream, out);
+        drained(req, stream, out);
+        let _ = writer.map(|w| w.shutdown(Shutdown::Both));
+        outcome
+    })
 }
 
-fn too_large() -> String {
-    format!(
-        "preview file exceeds {} MiB limit",
-        MAX_FILE_BYTES / 1024 / 1024
-    )
+fn answer(
+    req: &Request,
+    port: u16,
+    origin: TcpStream,
+    stream: &Stream,
+    out: &Sender<Message>,
+) -> Outcome {
+    let mut reader = BufReader::with_capacity(CHUNK, origin);
+    let response = match read_response(&mut reader) {
+        Ok(r) => r,
+        Err(_) if stream.cancelled() => {
+            return Outcome {
+                status: 0,
+                bytes: 0,
+            }
+        }
+        Err(e) => {
+            return respond(
+                req,
+                out,
+                stream,
+                502,
+                &format!("127.0.0.1:{port} gave no valid answer: {e}\n"),
+            )
+        }
+    };
+    let framing = match framing(&req.method, &response) {
+        Ok(f) => f,
+        Err(e) => {
+            return respond(
+                req,
+                out,
+                stream,
+                502,
+                &format!("127.0.0.1:{port} gave no valid answer: {e}\n"),
+            )
+        }
+    };
+    let bodied = framing != Framing::Empty;
+    send(
+        out,
+        json!({
+            "type": "http.response",
+            "id": req.id,
+            "status": response.status,
+            "headers": response_headers(&response, framing, port),
+            "body": bodied,
+        }),
+    );
+    let mut sent = 0u64;
+    if !bodied {
+        return Outcome {
+            status: response.status,
+            bytes: 0,
+        };
+    }
+    let mut body = Body::new(reader, framing);
+    loop {
+        match body.piece() {
+            Ok(Some(bytes)) => {
+                if !stream.room(sent, bytes.len() as u64) {
+                    break;
+                }
+                let _ = out.send(Message::binary(frame(req.id, &bytes)));
+                sent += bytes.len() as u64;
+            }
+            Ok(None) => {
+                send(out, json!({ "type": "http.response.end", "id": req.id }));
+                break;
+            }
+            Err(_) if stream.cancelled() => break,
+            Err(e) => {
+                cancel(
+                    req,
+                    out,
+                    &format!("127.0.0.1:{port} failed mid-answer: {e}"),
+                );
+                break;
+            }
+        }
+    }
+    Outcome {
+        status: response.status,
+        bytes: sent,
+    }
 }

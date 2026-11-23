@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, before, beforeEach, describe, it } from 'node:test';
@@ -17,13 +17,11 @@ function refusal(name, message) {
   return Object.assign(new Error(message), { name });
 }
 
-function mint(entry = 'index.html') {
-  const uuid = randomUUID();
-  const secret = randomBytes(8).toString('hex');
-  return {
-    token: `${uuid}.${secret}`,
-    url: `https://${uuid.replaceAll('-', '')}--${secret}.sliccy.now/${entry}`,
-  };
+const HOST_ID = randomBytes(10).toString('hex');
+
+function mint(entry) {
+  const token = `${HOST_ID}-${randomBytes(16).toString('hex')}`;
+  return { token, url: `https://${token}.sliccy.now/${entry ?? ''}` };
 }
 
 function publish(request) {
@@ -58,11 +56,7 @@ function publish(request) {
       controller = c;
       const webhook =
         request.options.bridge && !page.noBridge ? { webhook: 'serve-0123456789abcdef' } : {};
-      c.enqueue(
-        encoder.encode(
-          `${JSON.stringify({ url, previewToken: token, trayId: 't1', ...webhook })}\n`
-        )
-      );
+      c.enqueue(encoder.encode(`${JSON.stringify({ url, previewToken: token, ...webhook })}\n`));
     },
     cancel: (reason) => gone(String(reason)),
   });
@@ -112,7 +106,7 @@ const requests = {
     }
     if (request.kind === 'serve.stop') {
       const held = page.previews.get(request.options.previewToken);
-      if (!held) throw refusal('NotFoundError', 'the tray hub has no such preview');
+      if (!held) throw refusal('NotFoundError', 'the serve hub has no such preview');
       held.end('stopped with serve --stop');
       return '';
     }
@@ -218,12 +212,13 @@ describe('serve in a kernel with a page', { skip }, () => {
     assert.deepEqual(page.calls, [
       {
         kind: 'serve.publish',
-        options: { port: record.port, root: '/w/site', allowLive: false },
+        options: { port: record.port, root: '/w/site' },
       },
     ]);
     assert.equal(record.mode, 'live');
     assert.equal(record.previewToken, preview.token);
-    assert.equal(record.trayId, 't1');
+    assert.equal(record.trayId, undefined);
+    assert.equal(record.hostId, undefined);
     assert.equal((await os.sh(`test -e /proc/${record.pid}`)).status, 0);
     const mode = await os.sh(`stat -c %a ${STATE}/previews/${record.id}.json ${STATE}`);
     assert.equal(mode.stdout, '600\n700\n');
@@ -234,7 +229,7 @@ describe('serve in a kernel with a page', { skip }, () => {
       assert.equal((await os.fetch(record.port, path)).status, 404, path);
     }
 
-    preview.end('revoked by the tray hub');
+    preview.end('revoked by the serve hub');
     await gone(record.pid);
     assert.deepEqual(await records(), []);
     await refused(record.port);
@@ -315,7 +310,7 @@ describe('serve in a kernel with a page', { skip }, () => {
     const res = await run(['serve', '--port', String(port), '--entry', 'app/main.html']);
     assert.equal(res.status, 0, res.stderr);
     assert.deepEqual(page.calls, [
-      { kind: 'serve.publish', options: { port, entry: 'app/main.html', allowLive: true } },
+      { kind: 'serve.publish', options: { port, entry: 'app/main.html' } },
     ]);
     assert.match(res.stderr, new RegExp(`serve: 127\\.0\\.0\\.1:${port} is public at `));
     const ambiguous = await run(['serve', '--stop', String(port)]);
@@ -397,8 +392,8 @@ describe('serve in a kernel with a page', { skip }, () => {
   it("prints the page's refusals with the kernel's errno, and leaves nothing running", async () => {
     for (const [name, message, extra] of [
       ['NotAllowedError', 'the request to publish was dismissed', hint],
-      ['NotSupportedError', "seven isn't connected to the tray hub", ''],
-      ['TypeError', 'the tray is not connected\nsecond line', ''],
+      ['NotSupportedError', "seven isn't connected to the serve hub", ''],
+      ['TypeError', 'the serve hub is not connected\nsecond line', ''],
     ]) {
       page.fail = refusal(name, message);
       assert.deepEqual(await run(['serve', '/w/site']), {
@@ -423,39 +418,37 @@ describe('serve in a kernel with a page', { skip }, () => {
     assert.deepEqual(await records(), []);
   });
 
-  it("maps the tray hub's failures to exits 1, 3 and 4", async () => {
+  it("maps the serve hub's failures to exits 1, 3 and 4", async () => {
     const cases = [
       [
         {
           error: 'too many',
           status: 429,
-          code: 'LIVE_PREVIEW_LIMIT',
+          code: 'PREVIEW_LIMIT',
           retryAfter: '30',
-          active: 200,
-          limit: 200,
         },
         4,
-        "serve: publishing: the tray hub's limit is reached (429: too many (200 of 200 live previews in use); list them with `serve --list` and stop the ones you no longer need with `serve --stop <token>`)\nserve: retry after 30 s\n",
+        "serve: publishing: the serve hub's limit is reached (429: too many (PREVIEW_LIMIT))\nserve: retry after 30 s\n",
       ],
       [
         {
           error: 'sign in first',
           status: 403,
-          code: 'TRAY_REVOKED',
+          code: 'UNAUTHORIZED',
           signIn: 'https://auth.example/login',
         },
         3,
-        'serve: publishing: the tray hub refused it (403: sign in first (TRAY_REVOKED))\nserve: sign in at https://auth.example/login\n',
+        'serve: publishing: the serve hub refused it (403: sign in first (UNAUTHORIZED))\nserve: sign in at https://auth.example/login\n',
       ],
       [
         { error: 'gated', status: 302, signIn: 'https://auth.example/' },
         3,
-        'serve: the tray hub wants you to sign in: https://auth.example/\n',
+        'serve: the serve hub wants you to sign in: https://auth.example/\n',
       ],
       [
-        { error: 'invalid preview entry path', status: 400 },
+        { error: 'invalid entry', status: 400, code: 'INVALID_ENTRY' },
         1,
-        'serve: publishing: the tray hub answered 400: invalid preview entry path\n',
+        'serve: publishing: the serve hub answered 400: invalid entry (INVALID_ENTRY)\n',
       ],
     ];
     for (const [answer, status, stderr] of cases) {
@@ -502,7 +495,7 @@ describe('serve in a kernel with a page', { skip }, () => {
     assert.deepEqual(await run(['serve', '--stop', record.previewToken]), {
       status: 1,
       stdout: '',
-      stderr: 'serve: the tray hub has no such preview\n',
+      stderr: 'serve: the serve hub has no such preview\n',
     });
     assert.deepEqual(await run(['serve', '--stop', 'nothing']), {
       status: 1,
@@ -692,7 +685,7 @@ describe('serve without a page', { skip }, () => {
       await bare.sh('mkdir -p /w/site');
       for (const argv of [
         ['serve', '/w/site'],
-        ['scserve', '--stop', '00000000-0000-4000-a000-000000000000.abcdef'],
+        ['scserve', '--stop', `${'0'.repeat(20)}-${'a'.repeat(32)}`],
       ]) {
         const res = await bare.run(argv);
         assert.equal(res.status, 1);

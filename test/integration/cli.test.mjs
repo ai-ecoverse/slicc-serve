@@ -108,11 +108,11 @@ test('--upgrade from the npm launcher names the npm command', async () => {
   assert.equal(res.stdout, 'npm install -g @ai-ecoverse/slicc-serve@latest\n');
 });
 
-test('an invalid tray hub URL exits 1', async () => {
+test('an invalid serve hub URL exits 1', async () => {
   const box = sandbox();
-  const res = await box.run([box.site()], { SLICC_TRAY_HUB: 'ftp://nope' });
+  const res = await box.run([box.site()], { SLICC_SERVE_HUB: 'ftp://nope' });
   assert.equal(res.code, 1);
-  assert.match(res.stderr, /^scserve: invalid tray hub URL ftp:\/\/nope/);
+  assert.match(res.stderr, /^scserve: invalid serve hub URL ftp:\/\/nope/);
 });
 
 test('--entry refuses a symlink out of the directory', {

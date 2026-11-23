@@ -98,8 +98,7 @@ fn start(cmd: &str, spec: &Spec, store: &Store) -> Result<Held, Failure> {
     };
     let mut reader = None;
     if !spec.local {
-        let mut request =
-            json!({ "kind": "serve.publish", "port": port, "allowLive": spec.dir.is_none() });
+        let mut request = json!({ "kind": "serve.publish", "port": port });
         if let Some(dir) = &spec.dir {
             request["root"] = json!(dir);
         }
@@ -131,7 +130,7 @@ fn start(cmd: &str, spec: &Spec, store: &Store) -> Result<Held, Failure> {
         };
         record.url = Some(public_url(&url, entry.is_some()));
         record.preview_token = Some(token);
-        record.tray_id = text("trayId");
+        record.host_id = text("hostId");
         if spec.bridge {
             if text("webhook").is_none() {
                 return Err(Failure::plain(format!(
