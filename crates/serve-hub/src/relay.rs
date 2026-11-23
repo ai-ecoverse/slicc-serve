@@ -12,7 +12,7 @@ pub const WINDOW: u64 = 1024 * 1024;
 pub const MAX_HEAD: usize = 64 * 1024;
 pub const MAX_HEADERS: usize = 256;
 const CONNECT: Duration = Duration::from_secs(10);
-const READ: Duration = Duration::from_secs(120);
+pub const READ: Duration = Duration::from_secs(120);
 const TICK: Duration = Duration::from_secs(1);
 const HOP: [&str; 10] = [
     "connection",
@@ -561,7 +561,13 @@ fn write_body(
     !chunked || origin.write_all(b"0\r\n\r\n").is_ok()
 }
 
-pub fn serve(req: &Request, port: Option<u16>, stream: &Stream, out: &Sender<Message>) -> Outcome {
+pub fn serve(
+    req: &Request,
+    port: Option<u16>,
+    stream: &Stream,
+    out: &Sender<Message>,
+    read: Duration,
+) -> Outcome {
     let Some(port) = port else {
         return respond(
             req,
@@ -589,7 +595,7 @@ pub fn serve(req: &Request, port: Option<u16>, stream: &Stream, out: &Sender<Mes
         }
     };
     let _ = origin.set_nodelay(true);
-    let _ = origin.set_read_timeout((!req.body).then_some(READ));
+    let _ = origin.set_read_timeout((!req.body).then_some(read));
     if !stream.hold(&origin) {
         return Outcome {
             status: 0,
@@ -607,7 +613,7 @@ pub fn serve(req: &Request, port: Option<u16>, stream: &Stream, out: &Sender<Mes
             let chunked = head.chunked;
             scope.spawn(move || {
                 write_body(req, &mut w, chunked, stream, out);
-                let _ = w.set_read_timeout(Some(READ));
+                let _ = w.set_read_timeout(Some(read));
             });
         }
         let outcome = answer(req, port, origin, stream, out);

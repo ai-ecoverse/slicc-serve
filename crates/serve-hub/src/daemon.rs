@@ -121,6 +121,7 @@ pub struct Daemon {
     bridge: Arc<Bridge>,
     endpoint: Mutex<Option<Endpoint>>,
     info: Mutex<Value>,
+    read: Duration,
     me: Weak<Daemon>,
 }
 
@@ -171,6 +172,10 @@ pub fn run(dirs: Dirs) -> i32 {
         busy: AtomicUsize::new(0),
         activity: Mutex::new(Instant::now()),
         bridge: Arc::new(Bridge::new(serve_core::version())),
+        read: std::env::var("SCSERVE_ORIGIN_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map_or(relay::READ, Duration::from_millis),
         endpoint: Mutex::new(None),
         info: Mutex::new(Value::Null),
         hub,
@@ -781,8 +786,9 @@ impl Daemon {
             .unwrap()
             .insert(request.id, stream.clone());
         let conn = conn.clone();
+        let read = self.read;
         std::thread::spawn(move || {
-            let outcome = relay::serve(&request, port, &stream, &conn.out);
+            let outcome = relay::serve(&request, port, &stream, &conn.out, read);
             conn.streams.lock().unwrap().remove(&request.id);
             if let (Some(mut holder), true) = (holder, outcome.status > 0) {
                 let log = format!(

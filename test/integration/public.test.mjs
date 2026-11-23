@@ -498,3 +498,48 @@ test('--local goes to a running relay of another serve hub', async () => {
   assert.equal(public_.code, 1);
   assert.match(public_.stderr, new RegExp(`a relay for ${hub.origin} \\(pid \\d+`));
 });
+
+test('a --port upload that trickles for longer than the origin read timeout still gets its answer', async () => {
+  const slow = await fakeHub({ headMs: 60_000 });
+  after(() => slow.close());
+  const box = sandbox(slow);
+  const app = await listen(async (req, res) => {
+    let bytes = 0;
+    for await (const c of req) bytes += c.length;
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end(`got ${bytes}`);
+  });
+  const env = { SCSERVE_ORIGIN_TIMEOUT_MS: '1000' };
+  const res = await box.run(['--port', String(app.address().port)], env);
+  assert.equal(res.code, 0, res.stderr);
+  const url = new URL('upload', res.stdout.trim());
+  const answer = await new Promise((resolve, reject) => {
+    const r = request(
+      {
+        host: '127.0.0.1',
+        port: slow.port,
+        method: 'POST',
+        path: url.pathname,
+        headers: { host: url.host, 'transfer-encoding': 'chunked' },
+      },
+      (out) => {
+        const chunks = [];
+        out.on('data', (c) => chunks.push(c));
+        out.on('end', () =>
+          resolve({ status: out.statusCode, body: Buffer.concat(chunks).toString() })
+        );
+      }
+    );
+    r.on('error', reject);
+    let sent = 0;
+    const timer = setInterval(() => {
+      r.write('0123456789');
+      sent += 1;
+      if (sent === 6) {
+        clearInterval(timer);
+        r.end();
+      }
+    }, 500);
+  });
+  assert.deepEqual(answer, { status: 200, body: 'got 60' });
+});
