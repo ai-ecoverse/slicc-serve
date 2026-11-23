@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { root } from './helpers.mjs';
 
-export const SLICC_CDP = '2.1.11';
+export const SLICC_CDP = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+  .devDependencies['@ai-ecoverse/slicc-cdp'];
 export const CHROME = '158.0.8127.36';
 const RELEASE = `https://github.com/ai-ecoverse/slicc-cdp/releases/download/v${SLICC_CDP}`;
 const platform = { darwin: 'darwin', linux: 'linux', win32: 'windows' }[process.platform];
