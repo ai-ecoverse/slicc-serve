@@ -589,7 +589,7 @@ pub fn serve(req: &Request, port: Option<u16>, stream: &Stream, out: &Sender<Mes
         }
     };
     let _ = origin.set_nodelay(true);
-    let _ = origin.set_read_timeout(Some(READ));
+    let _ = origin.set_read_timeout((!req.body).then_some(READ));
     if !stream.hold(&origin) {
         return Outcome {
             status: 0,
@@ -605,7 +605,10 @@ pub fn serve(req: &Request, port: Option<u16>, stream: &Stream, out: &Sender<Mes
             writer.as_ref().and_then(|w| w.try_clone().ok()),
         ) {
             let chunked = head.chunked;
-            scope.spawn(move || write_body(req, &mut w, chunked, stream, out));
+            scope.spawn(move || {
+                write_body(req, &mut w, chunked, stream, out);
+                let _ = w.set_read_timeout(Some(READ));
+            });
         }
         let outcome = answer(req, port, origin, stream, out);
         drained(req, stream, out);

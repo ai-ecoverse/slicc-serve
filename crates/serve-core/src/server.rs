@@ -267,8 +267,12 @@ pub fn connection(mut stream: TcpStream, site: &Site, log: &Log, keep_alive: boo
             }
         };
         let declared = body_length(&req);
+        let waits = req
+            .header("expect")
+            .is_some_and(|e| e.trim().eq_ignore_ascii_case("100-continue"));
+        let closes = declared > DISCARD || (declared > 0 && waits);
         let mut keep = keep_alive && req.keep_alive();
-        if declared > DISCARD {
+        if closes {
             keep = false;
         } else if !discard(&mut stream, &mut carry, declared) {
             return;
@@ -277,7 +281,7 @@ pub fn connection(mut stream: TcpStream, site: &Site, log: &Log, keep_alive: boo
         let sent = write_reply(&mut stream, &reply, req.method == "HEAD", keep);
         log(&req, &reply);
         if sent.is_err() || !keep {
-            if declared > DISCARD {
+            if closes {
                 linger(&mut stream);
             }
             return;
