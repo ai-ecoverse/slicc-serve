@@ -44,7 +44,7 @@
   },
   "devDependencies": {
     "@ai-ecoverse/cherry": "6.260.21",
-    "@ai-ecoverse/slicc-cdp": "2.1.33",
+    "@ai-ecoverse/slicc-cdp": "2.2.2",
     "@ai-ecoverse/slicc-kernel": "1.191.4",
     "@ai-ecoverse/slicc-shared-web": "2.18.0",
     "@ai-ecoverse/wasm-bash": "5.3.0-23",
